@@ -40,6 +40,7 @@ export default function App() {
   const [joystick, setJoystick] = useState({ active: false, x: 0, y: 0, startX: 0, startY: 0 });
   const joystickRef = useRef({ x: 0, y: 0 });
   const [isMobile, setIsMobile] = useState(false);
+  const [canvasSize, setCanvasSize] = useState({ width: 800, height: 600 });
   
   const isPlayingRef = useRef(false);
   const isPausedRef = useRef(false);
@@ -60,7 +61,7 @@ export default function App() {
       pos: { x: MAP_WIDTH / 2, y: MAP_HEIGHT - 200 },
       hp: 300, maxHp: 300, speed: 5, radius: 24,
       attackRange: 90, attackDamage: 40, attackCooldown: 400, lastAttackTime: 0,
-      skillCooldown: 4000, lastSkillTime: Date.now(), isDead: false,
+      skillCooldown: 4000, lastSkillTime: 0, isDead: false,
       facingAngle: -Math.PI / 2, pushVelocity: { x: 0, y: 0 }, lastHitTime: 0,
     };
 
@@ -363,7 +364,7 @@ export default function App() {
     if (keysPressed.current.has('ArrowLeft') || keysPressed.current.has('a') || keysPressed.current.has('A')) dx -= 1;
     if (keysPressed.current.has('ArrowRight') || keysPressed.current.has('d') || keysPressed.current.has('D')) dx += 1;
 
-    const currentSpeed = isMobile ? player.speed * 1.5 : player.speed;
+    const currentSpeed = player.speed;
     if (dx !== 0 || dy !== 0) {
       const mag = Math.sqrt(dx * dx + dy * dy);
       player.pos.x += (dx / mag) * currentSpeed;
@@ -686,10 +687,10 @@ export default function App() {
     if (!ctx) return;
 
     // Camera logic: center on player, clamp to map bounds
-    let camX = state.player.pos.x - CANVAS_WIDTH / 2;
-    let camY = state.player.pos.y - CANVAS_HEIGHT / 2;
-    camX = Math.max(0, Math.min(MAP_WIDTH - CANVAS_WIDTH, camX));
-    camY = Math.max(0, Math.min(MAP_HEIGHT - CANVAS_HEIGHT, camY));
+    let camX = state.player.pos.x - canvasSize.width / 2;
+    let camY = state.player.pos.y - canvasSize.height / 2;
+    camX = Math.max(0, Math.min(Math.max(0, MAP_WIDTH - canvasSize.width), camX));
+    camY = Math.max(0, Math.min(Math.max(0, MAP_HEIGHT - canvasSize.height), camY));
 
     ctx.save();
     
@@ -702,7 +703,7 @@ export default function App() {
 
     // Background (Ocean/Abyss outside map)
     ctx.fillStyle = '#050505';
-    ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
 
     // Apply Camera Transform
     ctx.translate(-camX, -camY);
@@ -793,11 +794,17 @@ export default function App() {
   };
 
   useEffect(() => {
-    const checkMobile = () => {
-      setIsMobile('ontouchstart' in window || navigator.maxTouchPoints > 0);
+    const updateSize = () => {
+      const mobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0 || window.innerWidth < 1024;
+      setIsMobile(mobile);
+      if (mobile) {
+        setCanvasSize({ width: window.innerWidth, height: window.innerHeight });
+      } else {
+        setCanvasSize({ width: 800, height: 600 });
+      }
     };
-    checkMobile();
-    window.addEventListener('resize', checkMobile);
+    updateSize();
+    window.addEventListener('resize', updateSize);
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
@@ -922,9 +929,9 @@ export default function App() {
       <div className={isMobile ? "relative w-full h-full flex items-center justify-center bg-black" : "relative border-8 border-zinc-900 rounded-3xl overflow-hidden shadow-[0_0_50px_rgba(220,38,38,0.15)]"}>
         <canvas
           ref={canvasRef}
-          width={CANVAS_WIDTH}
-          height={CANVAS_HEIGHT}
-          className={isMobile ? "w-full h-full object-cover shadow-2xl" : "bg-black block"}
+          width={canvasSize.width}
+          height={canvasSize.height}
+          className={isMobile ? "w-full h-full block" : "bg-black block"}
           onClick={() => {
             if (!isPlaying && !uiState.gameOver && !uiState.gameWon) initGame();
             if (!isMobile) window.focus();
