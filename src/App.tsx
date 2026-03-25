@@ -38,10 +38,14 @@ export default function App() {
   const isPausedRef = useRef(false);
   const totalPausedTimeRef = useRef(0);
   const pauseStartTimeRef = useRef(0);
+  
+  const lastTimeRef = useRef<number>(0);
+  const accumulatorRef = useRef<number>(0);
+  const TIME_STEP = 1000 / 60; // 60 FPS fixed timestep
 
   const initGame = () => {
     const player: Entity = {
-      id: 'player', type: PieceType.KING, team: Team.RED,
+      id: 'player', type: PieceType.KING, team: Team.BLUE,
       pos: { x: MAP_WIDTH / 2, y: MAP_HEIGHT - 200 },
       hp: 300, maxHp: 300, speed: 5, radius: 24,
       attackRange: 90, attackDamage: 40, attackCooldown: 400, lastAttackTime: 0,
@@ -50,7 +54,7 @@ export default function App() {
     };
 
     const boss: Entity = {
-      id: 'boss', type: PieceType.KING, team: Team.BLUE,
+      id: 'boss', type: PieceType.KING, team: Team.RED,
       pos: { x: MAP_WIDTH / 2, y: 200 },
       hp: 1500, maxHp: 1500, speed: 2, radius: 35,
       attackRange: 120, attackDamage: 50, attackCooldown: 1500, lastAttackTime: 0,
@@ -72,6 +76,8 @@ export default function App() {
     
     totalPausedTimeRef.current = 0;
     pauseStartTimeRef.current = 0;
+    lastTimeRef.current = performance.now();
+    accumulatorRef.current = 0;
     isPausedRef.current = false;
     setIsPaused(false);
     isPlayingRef.current = true;
@@ -89,10 +95,9 @@ export default function App() {
     
     if (isPausedRef.current) {
       pauseStartTimeRef.current = Date.now();
-      if (requestRef.current) cancelAnimationFrame(requestRef.current);
     } else {
       totalPausedTimeRef.current += Date.now() - pauseStartTimeRef.current;
-      requestRef.current = requestAnimationFrame(update);
+      lastTimeRef.current = performance.now(); // Reset time to prevent huge delta
     }
   };
 
@@ -112,7 +117,7 @@ export default function App() {
 
     state.enemies.push({
       id: Math.random().toString(36).substring(2, 9),
-      type, team: Team.BLUE, pos: { x, y }, hp, maxHp: hp, speed, radius,
+      type, team: Team.RED, pos: { x, y }, hp, maxHp: hp, speed, radius,
       attackRange, attackDamage, attackCooldown: 1200, lastAttackTime: 0,
       skillCooldown: 0, lastSkillTime: 0, isDead: false,
       facingAngle: Math.PI / 2, pushVelocity: { x: 0, y: 0 }, lastHitTime: 0,
@@ -171,7 +176,7 @@ export default function App() {
 
   const updateAI = (entity: Entity, targets: Entity[], now: number) => {
     // Boss behavior
-    if (entity.type === PieceType.KING && entity.team === Team.BLUE) {
+    if (entity.type === PieceType.KING && entity.team === Team.RED) {
       if (Math.random() < 0.01 && gameStateRef.current!.enemies.length < 25) {
         spawnEnemy(PieceType.PAWN);
       }
@@ -200,15 +205,15 @@ export default function App() {
           closest.lastHitTime = now;
           closest.pushVelocity.x = Math.cos(angle) * 6;
           closest.pushVelocity.y = Math.sin(angle) * 6;
-          spawnDamageText(closest.pos.x, closest.pos.y - 20, entity.attackDamage.toString(), entity.team === Team.RED ? '#3b82f6' : '#ef4444');
+          spawnDamageText(closest.pos.x, closest.pos.y - 20, entity.attackDamage.toString(), entity.team === Team.BLUE ? '#3b82f6' : '#ef4444');
           if (closest.id === 'player') gameStateRef.current!.screenShake = 5;
         }
       }
     }
   };
 
-  const update = () => {
-    if (!gameStateRef.current || gameStateRef.current.gameOver || gameStateRef.current.gameWon || isPausedRef.current) return;
+  const simulateStep = () => {
+    if (!gameStateRef.current || gameStateRef.current.gameOver || gameStateRef.current.gameWon) return;
     const state = gameStateRef.current;
     const { player, allies, enemies, particles, damageTexts, walls } = state;
     const now = Date.now() - totalPausedTimeRef.current;
@@ -329,14 +334,14 @@ export default function App() {
           allies.push({
             ...enemy,
             id: Math.random().toString(),
-            team: Team.RED,
+            team: Team.BLUE,
             hp: enemy.maxHp, // Restore HP upon capture
             isDead: false,
             lastAttackTime: 0,
             pushVelocity: { x: 0, y: 0 }
           });
-          spawnParticles(enemy.pos.x, enemy.pos.y, '#ef4444', 25);
-          spawnDamageText(enemy.pos.x, enemy.pos.y - 40, "CAPTURED!", '#ef4444');
+          spawnParticles(enemy.pos.x, enemy.pos.y, '#3b82f6', 25);
+          spawnDamageText(enemy.pos.x, enemy.pos.y - 40, "CAPTURED!", '#3b82f6');
         }
         enemies.splice(i, 1);
       }
@@ -368,8 +373,27 @@ export default function App() {
     const elapsed = now - player.lastSkillTime;
     const skillPercent = Math.min(100, (elapsed / player.skillCooldown) * 100);
     setUiState({ score: state.score, skillPercent, gameOver: state.gameOver, gameWon: state.gameWon, allyCount: allies.length });
+  };
 
-    draw(state, now);
+  const update = (time: number) => {
+    if (!lastTimeRef.current) lastTimeRef.current = time;
+    const deltaTime = time - lastTimeRef.current;
+    lastTimeRef.current = time;
+
+    if (!gameStateRef.current || gameStateRef.current.gameOver || gameStateRef.current.gameWon || isPausedRef.current) {
+      requestRef.current = requestAnimationFrame(update);
+      return;
+    }
+
+    accumulatorRef.current += deltaTime;
+    if (accumulatorRef.current > 100) accumulatorRef.current = 100; // Cap to prevent spiral of death
+
+    while (accumulatorRef.current >= TIME_STEP) {
+      simulateStep();
+      accumulatorRef.current -= TIME_STEP;
+    }
+
+    draw(gameStateRef.current, Date.now() - totalPausedTimeRef.current);
     requestRef.current = requestAnimationFrame(update);
   };
 
@@ -378,15 +402,15 @@ export default function App() {
     ctx.translate(entity.pos.x, entity.pos.y);
 
     const isHit = now - entity.lastHitTime < 100;
-    const isRed = entity.team === Team.RED;
-    const isBoss = entity.type === PieceType.KING && entity.team === Team.BLUE;
+    const isBlue = entity.team === Team.BLUE;
+    const isBoss = entity.type === PieceType.KING && entity.team === Team.RED;
     
-    let baseColor = isHit ? '#ffffff' : (isRed ? '#7f1d1d' : '#1e3a8a');
-    let topColor = isHit ? '#ffffff' : (isRed ? '#ef4444' : '#3b82f6');
+    let baseColor = isHit ? '#ffffff' : (isBlue ? '#1e3a8a' : '#7f1d1d');
+    let topColor = isHit ? '#ffffff' : (isBlue ? '#3b82f6' : '#ef4444');
     
     if (isBoss) {
-      baseColor = isHit ? '#ffffff' : '#312e81';
-      topColor = isHit ? '#ffffff' : '#4f46e5';
+      baseColor = isHit ? '#ffffff' : '#450a0a';
+      topColor = isHit ? '#ffffff' : '#b91c1c';
     }
 
     const height = entity.radius * 1.5;
@@ -430,7 +454,7 @@ export default function App() {
 
     // Crown for Kings
     if (entity.type === PieceType.KING) {
-      ctx.fillStyle = isRed ? '#fbbf24' : '#94a3b8';
+      ctx.fillStyle = isBlue ? '#fbbf24' : '#94a3b8';
       ctx.beginPath();
       ctx.moveTo(-entity.radius * 0.6, -height - entity.radius * 0.4);
       ctx.lineTo(-entity.radius * 0.8, -height - entity.radius * 1.4);
@@ -464,7 +488,7 @@ export default function App() {
     ctx.fillRect(-barWidth/2 - 2, -barHeight/2 - 2, barWidth + 4, barHeight + 4);
     
     const fillPercent = Math.max(0, entity.hp / entity.maxHp);
-    ctx.fillStyle = isRed ? '#22c55e' : (isBoss ? '#a855f7' : '#ef4444');
+    ctx.fillStyle = isBlue ? '#22c55e' : (isBoss ? '#a855f7' : '#ef4444');
     ctx.fillRect(-barWidth/2, -barHeight/2, barWidth * fillPercent, barHeight);
     
     ctx.fillStyle = '#000000';
@@ -643,8 +667,8 @@ export default function App() {
             </div>
             <div className="w-px h-8 bg-zinc-800"></div>
             <div className="flex flex-col items-end">
-              <span className="text-[10px] uppercase text-zinc-500 font-black tracking-wider">Red Army</span>
-              <span className="text-2xl font-black italic text-red-500">{uiState.allyCount}</span>
+              <span className="text-[10px] uppercase text-zinc-500 font-black tracking-wider">Blue Army</span>
+              <span className="text-2xl font-black italic text-blue-500">{uiState.allyCount}</span>
             </div>
           </div>
           
@@ -727,15 +751,15 @@ export default function App() {
               >
                 {uiState.gameOver ? (
                   <>
-                    <Skull className="w-20 h-20 text-red-600 mx-auto mb-4 drop-shadow-[0_0_15px_rgba(220,38,38,0.5)]" />
+                    <Skull className="w-20 h-20 text-blue-600 mx-auto mb-4 drop-shadow-[0_0_15px_rgba(37,99,235,0.5)]" />
                     <h2 className="text-4xl font-black italic uppercase mb-2 text-white">Checkmate</h2>
-                    <p className="text-zinc-400 mb-8 font-bold uppercase tracking-widest text-sm">The Red King has fallen</p>
+                    <p className="text-zinc-400 mb-8 font-bold uppercase tracking-widest text-sm">The Blue King has fallen</p>
                   </>
                 ) : uiState.gameWon ? (
                   <>
                     <Trophy className="w-20 h-20 text-yellow-500 mx-auto mb-4 drop-shadow-[0_0_15px_rgba(234,179,8,0.5)]" />
                     <h2 className="text-4xl font-black italic uppercase mb-2 text-white">Victory!</h2>
-                    <p className="text-zinc-400 mb-8 font-bold uppercase tracking-widest text-sm">The Blue King is defeated</p>
+                    <p className="text-zinc-400 mb-8 font-bold uppercase tracking-widest text-sm">The Red King is defeated</p>
                   </>
                 ) : (
                   <>
