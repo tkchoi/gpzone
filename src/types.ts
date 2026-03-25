@@ -7,8 +7,8 @@ export enum PieceType {
 }
 
 export enum Team {
-  NEUTRAL = 'NEUTRAL',
-  PLAYER = 'PLAYER',
+  RED = 'RED',
+  BLUE = 'BLUE',
 }
 
 export interface Position {
@@ -27,7 +27,6 @@ export interface Entity {
   id: string;
   type: PieceType;
   team: Team;
-  ownerId: string | null; // null if neutral
   pos: Position;
   hp: number;
   maxHp: number;
@@ -43,9 +42,6 @@ export interface Entity {
   facingAngle: number;
   pushVelocity: Position;
   lastHitTime: number;
-  score: number;
-  name: string;
-  armyCount: number;
 }
 
 export interface Particle {
@@ -69,29 +65,14 @@ export interface DamageText {
 }
 
 export interface GameState {
-  players: Record<string, Entity>;
-  minions: Record<string, Entity>;
+  player: Entity;
+  allies: Entity[];
+  enemies: Entity[];
+  particles: Particle[];
+  damageTexts: DamageText[];
   walls: Wall[];
-  leaderboard: { id: string, name: string, score: number }[];
-}
-
-export interface InputState {
-  up: boolean;
-  down: boolean;
-  left: boolean;
-  right: boolean;
-  attack: boolean;
-  skill: boolean;
-  mouseX: number;
-  mouseY: number;
-}
-
-export interface EffectEvent {
-  type: 'damage' | 'particle' | 'shake';
-  x?: number;
-  y?: number;
-  value?: number;
-  color?: string;
-  count?: number;
-  intensity?: number;
+  score: number;
+  gameOver: boolean;
+  gameWon: boolean;
+  screenShake: number;
 }
