@@ -36,6 +36,11 @@ export default function App() {
   const keysPressed = useRef<Set<string>>(new Set());
   const gameStateRef = useRef<GameState | null>(null);
   
+  // Mobile Control States
+  const [joystick, setJoystick] = useState({ active: false, x: 0, y: 0, startX: 0, startY: 0 });
+  const joystickRef = useRef({ x: 0, y: 0 });
+  const [isMobile, setIsMobile] = useState(false);
+  
   const isPlayingRef = useRef(false);
   const isPausedRef = useRef(false);
   const totalPausedTimeRef = useRef(0);
@@ -359,6 +364,11 @@ export default function App() {
       player.pos.x += (dx / mag) * player.speed;
       player.pos.y += (dy / mag) * player.speed;
       player.facingAngle = Math.atan2(dy, dx);
+    } else if (joystickRef.current.x !== 0 || joystickRef.current.y !== 0) {
+      // Mobile Joystick Movement
+      player.pos.x += joystickRef.current.x * player.speed;
+      player.pos.y += joystickRef.current.y * player.speed;
+      player.facingAngle = Math.atan2(joystickRef.current.y, joystickRef.current.x);
     }
 
     // Apply knockback
@@ -368,6 +378,11 @@ export default function App() {
     player.pushVelocity.y *= 0.8;
 
     resolveWallCollision(player, walls);
+    
+    // Strict Map Bound Check (Outer wall thickness is 60)
+    const margin = 60 + player.radius;
+    player.pos.x = Math.max(margin, Math.min(MAP_WIDTH - margin, player.pos.x));
+    player.pos.y = Math.max(margin, Math.min(MAP_HEIGHT - margin, player.pos.y));
 
     // Player Attack (Z or J)
     if (keysPressed.current.has('z') || keysPressed.current.has('Z') || keysPressed.current.has('j') || keysPressed.current.has('J')) {
@@ -773,6 +788,12 @@ export default function App() {
   };
 
   useEffect(() => {
+    const checkMobile = () => {
+      setIsMobile('ontouchstart' in window || navigator.maxTouchPoints > 0);
+    };
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+
     const handleKeyDown = (e: KeyboardEvent) => {
       if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
         e.preventDefault();
@@ -805,147 +826,184 @@ export default function App() {
     };
   }, [isPlaying]);
 
+  const handleJoystickStart = (e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    setJoystick({ active: true, x: 0, y: 0, startX: touch.clientX, startY: touch.clientY });
+  };
+
+  const handleJoystickMove = (e: React.TouchEvent) => {
+    if (!joystick.active) return;
+    const touch = e.touches[0];
+    const dx = touch.clientX - joystick.startX;
+    const dy = touch.clientY - joystick.startY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const maxDist = 50;
+    
+    const limitedX = dist > maxDist ? (dx / dist) * maxDist : dx;
+    const limitedY = dist > maxDist ? (dy / dist) * maxDist : dy;
+    
+    setJoystick(prev => ({ ...prev, x: limitedX, y: limitedY }));
+    joystickRef.current = { x: limitedX / maxDist, y: limitedY / maxDist };
+  };
+
+  const handleJoystickEnd = () => {
+    setJoystick({ active: false, x: 0, y: 0, startX: 0, startY: 0 });
+    joystickRef.current = { x: 0, y: 0 };
+  };
+
+  const triggerAttack = () => {
+    keysPressed.current.add('z');
+    setTimeout(() => keysPressed.current.delete('z'), 100);
+  };
+
+  const triggerSkill = () => {
+    keysPressed.current.add('x');
+    setTimeout(() => keysPressed.current.delete('x'), 100);
+  };
+
   return (
-    <div className="min-h-screen bg-[#050505] text-white font-sans flex flex-col items-center justify-center p-4 select-none">
-      {/* Header */}
-      <div className="w-full max-w-[800px] flex justify-between items-center mb-4 px-2">
-        <div className="flex flex-col">
-          <h1 className="text-5xl font-black tracking-tighter italic uppercase text-red-600 leading-none drop-shadow-md">
-            DARK ZONE
-          </h1>
-          <div className="flex items-center gap-3 mt-1">
-            <span className="text-xs uppercase tracking-[0.3em] text-zinc-500 font-bold">
-              Hashima Skirmish
-            </span>
-            <span className="bg-blue-600 text-white text-[10px] font-black px-2 py-0.5 rounded-full uppercase tracking-widest">
-              v1.0.2 (Blue Ally Patch)
-            </span>
-          </div>
-        </div>
-        <div className="flex gap-4 items-center">
-          <div className="flex gap-6 items-center bg-zinc-900/80 px-6 py-2 rounded-2xl border-2 border-zinc-800">
-            <div className="flex flex-col items-end">
-              <span className="text-[10px] uppercase text-zinc-500 font-black tracking-wider">Score</span>
-              <span className="text-2xl font-black italic text-white">{uiState.score}</span>
-            </div>
-            <div className="w-px h-8 bg-zinc-800"></div>
-            <div className="flex flex-col items-end">
-              <span className="text-[10px] uppercase text-zinc-500 font-black tracking-wider">Blue Army</span>
-              <span className="text-2xl font-black italic text-blue-500">{uiState.allyCount}</span>
+    <div className={isMobile ? "fixed inset-0 bg-[#050505] text-white font-sans flex flex-col items-center justify-center select-none overflow-hidden touch-none" : "min-h-screen bg-[#050505] text-white font-sans flex flex-col items-center justify-center p-4 select-none"}>
+      {/* Desktop Header */}
+      {!isMobile && (
+        <div className="w-full max-w-[800px] flex justify-between items-center mb-4 px-2">
+          <div className="flex flex-col">
+            <h1 className="text-5xl font-black tracking-tighter italic uppercase text-red-600 leading-none drop-shadow-md">
+              DARK ZONE
+            </h1>
+            <div className="flex items-center gap-3 mt-1">
+              <span className="text-xs uppercase tracking-[0.3em] text-zinc-500 font-bold">
+                Hashima Skirmish
+              </span>
+              <span className="bg-blue-600 text-white text-[10px] font-black px-2 py-0.5 rounded-full uppercase tracking-widest">
+                v1.0.2 (Blue Ally Patch)
+              </span>
             </div>
           </div>
-          
-          {/* Controls */}
-          <div className="flex gap-2">
-            <button 
-              onClick={togglePause} 
-              disabled={!isPlaying || uiState.gameOver || uiState.gameWon}
-              className="p-3 bg-zinc-900/80 rounded-2xl border-2 border-zinc-800 hover:bg-zinc-800 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              title="Pause (P or Esc)"
-            >
-              {isPaused ? <Play className="w-6 h-6" /> : <Pause className="w-6 h-6" />}
-            </button>
-            <button 
-              onClick={initGame} 
-              className="p-3 bg-zinc-900/80 rounded-2xl border-2 border-zinc-800 hover:bg-red-900/50 hover:border-red-800 text-white transition-colors"
-              title="Restart"
-            >
-              <RotateCcw className="w-6 h-6" />
-            </button>
+          <div className="flex gap-4 items-center">
+            <div className="flex gap-6 items-center bg-zinc-900/80 px-6 py-2 rounded-2xl border-2 border-zinc-800">
+              <div className="flex flex-col items-end">
+                <span className="text-[10px] uppercase text-zinc-500 font-black tracking-wider">Score</span>
+                <span className="text-2xl font-black italic text-white">{uiState.score}</span>
+              </div>
+              <div className="w-px h-8 bg-zinc-800"></div>
+              <div className="flex flex-col items-end">
+                <span className="text-[10px] uppercase text-zinc-500 font-black tracking-wider">Blue Army</span>
+                <span className="text-2xl font-black italic text-blue-500">{uiState.allyCount}</span>
+              </div>
+            </div>
+            
+            <div className="flex gap-2">
+              <button 
+                onClick={togglePause} 
+                disabled={!isPlaying || uiState.gameOver || uiState.gameWon}
+                className="p-3 bg-zinc-900/80 rounded-2xl border-2 border-zinc-800 hover:bg-zinc-800 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                title="Pause (P or Esc)"
+              >
+                {isPaused ? <Play className="w-6 h-6" /> : <Pause className="w-6 h-6" />}
+              </button>
+              <button 
+                onClick={initGame} 
+                className="p-3 bg-zinc-900/80 rounded-2xl border-2 border-zinc-800 hover:bg-red-900/50 hover:border-red-800 text-white transition-colors"
+                title="Restart"
+              >
+                <RotateCcw className="w-6 h-6" />
+              </button>
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
       {/* Game Canvas Container */}
-      <div 
-        className="relative border-8 border-zinc-900 rounded-3xl overflow-hidden shadow-[0_0_50px_rgba(220,38,38,0.15)]"
-        onClick={() => window.focus()}
-      >
+      <div className={isMobile ? "relative w-full h-full flex items-center justify-center bg-black" : "relative border-8 border-zinc-900 rounded-3xl overflow-hidden shadow-[0_0_50px_rgba(220,38,38,0.15)]"}>
         <canvas
           ref={canvasRef}
           width={CANVAS_WIDTH}
           height={CANVAS_HEIGHT}
-          className="bg-black block"
+          className={isMobile ? "max-w-full max-h-full object-contain shadow-2xl" : "bg-black block"}
+          onClick={() => {
+            if (!isPlaying && !uiState.gameOver && !uiState.gameWon) initGame();
+            if (!isMobile) window.focus();
+          }}
         />
 
-        {/* Pause Overlay */}
-        <AnimatePresence>
-          {isPaused && !uiState.gameOver && !uiState.gameWon && (
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="absolute inset-0 bg-black/60 backdrop-blur-sm flex flex-col items-center justify-center z-40"
+        {/* Mobile Controls Overlay */}
+        {isMobile && isPlaying && !isPaused && (
+          <div className="absolute inset-0 pointer-events-none">
+            {/* Joystick Area */}
+            <div 
+              className="absolute bottom-8 left-8 w-48 h-48 flex items-center justify-center pointer-events-auto"
+              onTouchStart={handleJoystickStart}
+              onTouchMove={handleJoystickMove}
+              onTouchEnd={handleJoystickEnd}
             >
-              <h2 className="text-5xl font-black italic uppercase mb-8 text-white tracking-widest drop-shadow-lg">Paused</h2>
-              <div className="flex gap-4">
-                <button
-                  onClick={togglePause}
-                  className="bg-zinc-100 hover:bg-white text-black font-black italic text-xl uppercase px-8 py-4 rounded-2xl transition-all flex items-center justify-center gap-3 border-b-4 border-zinc-400 active:border-b-0 active:translate-y-1"
-                >
-                  <Play className="w-6 h-6 fill-current" />
-                  Resume
-                </button>
-                <button
-                  onClick={initGame}
-                  className="bg-red-600 hover:bg-red-500 text-white font-black italic text-xl uppercase px-8 py-4 rounded-2xl transition-all flex items-center justify-center gap-3 border-b-4 border-red-800 active:border-b-0 active:translate-y-1"
-                >
-                  <RotateCcw className="w-6 h-6" />
-                  Restart
-                </button>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        {/* Start / Game Over Overlay */}
-        <AnimatePresence>
-          {!isPlaying && (
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="absolute inset-0 bg-black/80 backdrop-blur-md flex flex-col items-center justify-center z-50"
-            >
-              <motion.div
-                initial={{ scale: 0.8, y: 20 }}
-                animate={{ scale: 1, y: 0 }}
-                className="bg-zinc-900 p-10 rounded-3xl border-4 border-zinc-800 shadow-2xl text-center max-w-md w-full"
-              >
-                {uiState.gameOver ? (
-                  <>
-                    <Skull className="w-20 h-20 text-blue-600 mx-auto mb-4 drop-shadow-[0_0_15px_rgba(37,99,235,0.5)]" />
-                    <h2 className="text-4xl font-black italic uppercase mb-2 text-white">Checkmate</h2>
-                    <p className="text-zinc-400 mb-8 font-bold uppercase tracking-widest text-sm">The Blue King has fallen</p>
-                  </>
-                ) : uiState.gameWon ? (
-                  <>
-                    <Trophy className="w-20 h-20 text-yellow-500 mx-auto mb-4 drop-shadow-[0_0_15px_rgba(234,179,8,0.5)]" />
-                    <h2 className="text-4xl font-black italic uppercase mb-2 text-white">Victory!</h2>
-                    <p className="text-zinc-400 mb-8 font-bold uppercase tracking-widest text-sm">The Red King is defeated</p>
-                  </>
-                ) : (
-                  <>
-                    <ShieldAlert className="w-20 h-20 text-red-600 mx-auto mb-4 drop-shadow-[0_0_15px_rgba(220,38,38,0.5)]" />
-                    <h2 className="text-4xl font-black italic uppercase mb-2 text-white">Enter the Zone</h2>
-                    <p className="text-zinc-400 mb-8 font-bold uppercase tracking-widest text-sm">Capture enemies to build your army</p>
-                  </>
+              <div className="w-32 h-32 rounded-full bg-white/10 border-2 border-white/20 flex items-center justify-center backdrop-blur-sm">
+                <div className="w-16 h-16 rounded-full bg-white/5 border border-white/10" />
+                {joystick.active && (
+                  <motion.div 
+                    className="absolute w-16 h-16 rounded-full bg-white/40 shadow-[0_0_20px_rgba(255,255,255,0.3)] border border-white/50"
+                    style={{ x: joystick.x, y: joystick.y }}
+                  />
                 )}
+              </div>
+            </div>
 
-                <button
-                  onClick={initGame}
-                  className="w-full bg-red-600 hover:bg-red-500 text-white font-black italic text-xl uppercase py-5 rounded-2xl transition-all flex items-center justify-center gap-3 group border-b-4 border-red-800 active:border-b-0 active:translate-y-1"
+            {/* Action Buttons Area */}
+            <div className="absolute bottom-8 right-8 flex items-end gap-6 pointer-events-auto">
+              {/* Skill Button */}
+              <div className="flex flex-col items-center gap-2">
+                <button 
+                  className="w-20 h-20 rounded-full bg-blue-600/60 border-2 border-blue-400/40 flex items-center justify-center shadow-lg active:scale-90 transition-transform backdrop-blur-sm relative overflow-hidden"
+                  onTouchStart={(e) => { e.preventDefault(); triggerSkill(); }}
                 >
-                  <Play className="w-6 h-6 fill-current" />
-                  {uiState.gameOver || uiState.gameWon ? 'Play Again' : 'Start Battle'}
+                  <Zap className={`w-10 h-10 ${uiState.skillPercent >= 100 ? 'text-white fill-white animate-pulse' : 'text-blue-200/50'}`} />
+                  <div 
+                    className="absolute inset-0 bg-black/40 transition-all duration-100"
+                    style={{ height: `${100 - uiState.skillPercent}%` }}
+                  />
                 </button>
-              </motion.div>
-            </motion.div>
-          )}
-        </AnimatePresence>
+                <span className="text-[10px] font-black italic text-blue-400 tracking-widest drop-shadow-md">DASH</span>
+              </div>
 
-        {/* In-game HUD */}
-        {isPlaying && (
+              {/* Attack Button */}
+              <div className="flex flex-col items-center gap-2">
+                <button 
+                  className="w-28 h-28 rounded-full bg-red-600/70 border-2 border-red-400/50 flex items-center justify-center shadow-[0_0_30px_rgba(220,38,38,0.3)] active:scale-90 transition-transform backdrop-blur-sm"
+                  onTouchStart={(e) => { e.preventDefault(); triggerAttack(); }}
+                >
+                  <Sword className="w-14 h-14 text-white" />
+                </button>
+                <span className="text-[10px] font-black italic text-red-500 tracking-widest drop-shadow-md">ATTACK</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* UI HUD Overlay (Mobile) */}
+        {isMobile && isPlaying && (
+          <div className="absolute top-6 left-6 right-6 flex justify-between items-start pointer-events-none">
+            <div className="flex flex-col gap-2">
+              <div className="text-4xl font-black italic tracking-tighter text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.8)]">
+                {uiState.score.toLocaleString()}
+              </div>
+              <div className="flex items-center gap-2 bg-blue-900/40 px-3 py-1 rounded-full border border-blue-500/30 backdrop-blur-md">
+                <Skull className="w-4 h-4 text-blue-400" />
+                <span className="text-xs font-black text-blue-100 uppercase tracking-widest">
+                  {uiState.allyCount}
+                </span>
+              </div>
+            </div>
+            
+            <button 
+              onClick={togglePause}
+              className="p-4 bg-white/10 hover:bg-white/20 rounded-2xl border border-white/20 backdrop-blur-md pointer-events-auto transition-colors shadow-xl"
+            >
+              {isPaused ? <Play className="w-6 h-6 fill-white" /> : <Pause className="w-6 h-6 fill-white" />}
+            </button>
+          </div>
+        )}
+
+        {/* Desktop HUD (Attack/Dash Indicators) */}
+        {!isMobile && isPlaying && (
           <div className="absolute bottom-6 right-6 flex gap-4 pointer-events-none">
             <div className="flex flex-col items-center">
               <div className="w-20 h-20 rounded-full bg-zinc-900/90 border-4 border-zinc-700 flex items-center justify-center relative overflow-hidden shadow-lg">
@@ -970,28 +1028,125 @@ export default function App() {
         )}
       </div>
 
-      {/* Controls Help */}
-      <div className="mt-8 grid grid-cols-3 gap-6 text-center max-w-[800px] w-full">
-        <div className="bg-zinc-900/80 p-5 rounded-3xl border-2 border-zinc-800 flex flex-col items-center shadow-lg">
-          <span className="block text-[11px] uppercase text-zinc-400 font-black tracking-widest mb-3">Move</span>
-          <div className="flex flex-col items-center gap-1">
-            <kbd className="w-10 h-10 flex items-center justify-center bg-zinc-800 rounded-xl text-lg font-black border-b-4 border-zinc-950 text-white">↑</kbd>
-            <div className="flex gap-1">
-              <kbd className="w-10 h-10 flex items-center justify-center bg-zinc-800 rounded-xl text-lg font-black border-b-4 border-zinc-950 text-white">←</kbd>
-              <kbd className="w-10 h-10 flex items-center justify-center bg-zinc-800 rounded-xl text-lg font-black border-b-4 border-zinc-950 text-white">↓</kbd>
-              <kbd className="w-10 h-10 flex items-center justify-center bg-zinc-800 rounded-xl text-lg font-black border-b-4 border-zinc-950 text-white">→</kbd>
+      {/* Desktop Controls Help */}
+      {!isMobile && (
+        <div className="mt-8 grid grid-cols-3 gap-6 text-center max-w-[800px] w-full">
+          <div className="bg-zinc-900/80 p-5 rounded-3xl border-2 border-zinc-800 flex flex-col items-center shadow-lg">
+            <span className="block text-[11px] uppercase text-zinc-400 font-black tracking-widest mb-3">Move</span>
+            <div className="flex flex-col items-center gap-1">
+              <kbd className="w-10 h-10 flex items-center justify-center bg-zinc-800 rounded-xl text-lg font-black border-b-4 border-zinc-950 text-white">↑</kbd>
+              <div className="flex gap-1">
+                <kbd className="w-10 h-10 flex items-center justify-center bg-zinc-800 rounded-xl text-lg font-black border-b-4 border-zinc-950 text-white">←</kbd>
+                <kbd className="w-10 h-10 flex items-center justify-center bg-zinc-800 rounded-xl text-lg font-black border-b-4 border-zinc-950 text-white">↓</kbd>
+                <kbd className="w-10 h-10 flex items-center justify-center bg-zinc-800 rounded-xl text-lg font-black border-b-4 border-zinc-950 text-white">→</kbd>
+              </div>
             </div>
           </div>
+          <div className="bg-zinc-900/80 p-5 rounded-3xl border-2 border-zinc-800 flex flex-col items-center justify-center shadow-lg">
+            <span className="block text-[11px] uppercase text-zinc-400 font-black tracking-widest mb-3">Attack</span>
+            <kbd className="w-16 h-16 flex items-center justify-center bg-red-900/50 rounded-2xl text-2xl font-black italic border-b-4 border-red-950 text-red-500">Z</kbd>
+          </div>
+          <div className="bg-zinc-900/80 p-5 rounded-3xl border-2 border-zinc-800 flex flex-col items-center justify-center shadow-lg">
+            <span className="block text-[11px] uppercase text-zinc-400 font-black tracking-widest mb-3">Skill (Dash)</span>
+            <kbd className="w-16 h-16 flex items-center justify-center bg-yellow-900/50 rounded-2xl text-2xl font-black italic border-b-4 border-yellow-950 text-yellow-500">X</kbd>
+          </div>
         </div>
-        <div className="bg-zinc-900/80 p-5 rounded-3xl border-2 border-zinc-800 flex flex-col items-center justify-center shadow-lg">
-          <span className="block text-[11px] uppercase text-zinc-400 font-black tracking-widest mb-3">Attack</span>
-          <kbd className="w-16 h-16 flex items-center justify-center bg-red-900/50 rounded-2xl text-2xl font-black italic border-b-4 border-red-950 text-red-500">Z</kbd>
-        </div>
-        <div className="bg-zinc-900/80 p-5 rounded-3xl border-2 border-zinc-800 flex flex-col items-center justify-center shadow-lg">
-          <span className="block text-[11px] uppercase text-zinc-400 font-black tracking-widest mb-3">Skill (Dash)</span>
-          <kbd className="w-16 h-16 flex items-center justify-center bg-yellow-900/50 rounded-2xl text-2xl font-black italic border-b-4 border-yellow-950 text-yellow-500">X</kbd>
-        </div>
-      </div>
+      )}
+
+      {/* Overlays (Start, Game Over, Pause) */}
+      <AnimatePresence>
+        {!isPlaying && !uiState.gameOver && !uiState.gameWon && (
+          <motion.div 
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/90 backdrop-blur-xl p-8 text-center"
+          >
+            <motion.div
+              initial={{ scale: 0.8, y: 20 }} animate={{ scale: 1, y: 0 }}
+              className="max-w-md"
+            >
+              <h1 className="text-7xl font-black italic tracking-tighter text-red-600 mb-2 drop-shadow-[0_0_30px_rgba(220,38,38,0.5)]">
+                DARK ZONE
+              </h1>
+              <p className="text-zinc-400 text-sm uppercase tracking-[0.3em] mb-12 font-bold">
+                Piece Survival Skirmish
+              </p>
+              
+              <button
+                onClick={initGame}
+                className="group relative px-12 py-6 bg-red-600 hover:bg-red-500 transition-all rounded-full overflow-hidden shadow-[0_0_50px_rgba(220,38,38,0.3)]"
+              >
+                <div className="relative z-10 flex items-center gap-4">
+                  <Play className="w-8 h-8 fill-white" />
+                  <span className="text-2xl font-black italic uppercase tracking-tighter">ENTER THE ZONE</span>
+                </div>
+                <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent -translate-x-full group-hover:translate-x-full transition-transform duration-1000" />
+              </button>
+            </motion.div>
+          </motion.div>
+        )}
+
+        {isPaused && (
+          <motion.div 
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-black/60 backdrop-blur-md"
+          >
+            <div className="bg-zinc-900/90 p-12 rounded-[40px] border border-white/10 shadow-2xl flex flex-col items-center gap-8">
+              <h2 className="text-6xl font-black italic tracking-tighter text-white">PAUSED</h2>
+              <button
+                onClick={togglePause}
+                className="px-12 py-5 bg-white text-black rounded-full font-black italic text-xl hover:scale-105 transition-transform"
+              >
+                RESUME MISSION
+              </button>
+            </div>
+          </motion.div>
+        )}
+
+        {(uiState.gameOver || uiState.gameWon) && (
+          <motion.div 
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+            className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/95 backdrop-blur-2xl p-8 text-center"
+          >
+            <motion.div
+              initial={{ scale: 0.5, y: 50 }} animate={{ scale: 1, y: 0 }}
+              className="flex flex-col items-center"
+            >
+              {uiState.gameWon ? (
+                <div className="mb-8">
+                  <div className="w-32 h-32 bg-yellow-500 rounded-full flex items-center justify-center mx-auto mb-6 shadow-[0_0_60px_rgba(234,179,8,0.4)]">
+                    <Trophy className="w-16 h-16 text-black" />
+                  </div>
+                  <h2 className="text-8xl font-black italic tracking-tighter text-yellow-500 leading-none">VICTORY</h2>
+                  <p className="text-yellow-500/60 uppercase tracking-[0.4em] font-bold mt-2">Zone Secured</p>
+                </div>
+              ) : (
+                <div className="mb-8">
+                  <div className="w-32 h-32 bg-red-600 rounded-full flex items-center justify-center mx-auto mb-6 shadow-[0_0_60px_rgba(220,38,38,0.4)]">
+                    <Skull className="w-16 h-16 text-white" />
+                  </div>
+                  <h2 className="text-8xl font-black italic tracking-tighter text-red-600 leading-none">DEFEATED</h2>
+                  <p className="text-red-600/60 uppercase tracking-[0.4em] font-bold mt-2">Signal Lost</p>
+                </div>
+              )}
+              
+              <div className="bg-white/5 backdrop-blur-md border border-white/10 p-8 rounded-[32px] mb-12 min-w-[300px]">
+                <div className="text-zinc-500 text-xs uppercase tracking-widest font-bold mb-1">Final Score</div>
+                <div className="text-6xl font-black italic text-white tracking-tighter">
+                  {uiState.score.toLocaleString()}
+                </div>
+              </div>
+
+              <button
+                onClick={initGame}
+                className="flex items-center gap-4 px-12 py-6 bg-white text-black rounded-full font-black italic text-2xl hover:scale-105 transition-transform shadow-xl"
+              >
+                <RotateCcw className="w-8 h-8" />
+                REDEPLOY
+              </button>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
