@@ -245,16 +245,34 @@ export default function App() {
 
       const angle = Math.atan2(target.pos.y - entity.pos.y, target.pos.x - entity.pos.x);
       
-      // Aggressive Pursuit
+      // Aggressive Pursuit with Wall Avoidance
       if (minDist > entity.attackRange - 20) {
         let moveAngle = angle;
         
-        // Strafing to avoid being a sitting duck
-        const strafeFactor = Math.sin(now / 400) * 0.5;
+        // Strafing
+        const strafeFactor = Math.sin(now / 400) * 0.6;
         moveAngle += strafeFactor;
 
-        entity.pos.x += Math.cos(moveAngle) * currentSpeed;
-        entity.pos.y += Math.sin(moveAngle) * currentSpeed;
+        let vx = Math.cos(moveAngle) * currentSpeed;
+        let vy = Math.sin(moveAngle) * currentSpeed;
+
+        // Wall Repulsion for Boss
+        state.walls.forEach(w => {
+          const closestX = Math.max(w.x, Math.min(entity.pos.x, w.x + w.width));
+          const closestY = Math.max(w.y, Math.min(entity.pos.y, w.y + w.height));
+          const dx = entity.pos.x - closestX;
+          const dy = entity.pos.y - closestY;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          
+          if (dist < 100 && dist > 0) { // Repulsion range
+            const force = (100 - dist) / 100;
+            vx += (dx / dist) * force * 3;
+            vy += (dy / dist) * force * 3;
+          }
+        });
+
+        entity.pos.x += vx;
+        entity.pos.y += vy;
         entity.facingAngle = angle;
       } else {
         // Attack
@@ -309,8 +327,13 @@ export default function App() {
           closest.pushVelocity.x = Math.cos(angle) * 6;
           closest.pushVelocity.y = Math.sin(angle) * 6;
           spawnDamageText(closest.pos.x, closest.pos.y - 20, entity.attackDamage.toString(), entity.team === Team.BLUE ? '#3b82f6' : '#ef4444');
-          if (closest.id === 'player') {
-            state.screenShake = 5;
+          if (entity.team === Team.BLUE) {
+            soundManager.playAllyHit();
+          } else {
+            // Enemy attacking player or ally
+            if (closest.id === 'player') {
+              state.screenShake = 5;
+            }
             soundManager.playHit();
           }
         }
@@ -350,6 +373,7 @@ export default function App() {
     if (keysPressed.current.has('z') || keysPressed.current.has('Z') || keysPressed.current.has('j') || keysPressed.current.has('J')) {
       if (now - player.lastAttackTime > player.attackCooldown) {
         player.lastAttackTime = now;
+        soundManager.playSwing(); // Play swing sound even on miss
         const attackSpread = Math.PI / 1.5; // 120 degrees
         enemies.forEach(e => {
           const edx = e.pos.x - player.pos.x;
@@ -369,7 +393,7 @@ export default function App() {
               spawnDamageText(e.pos.x, e.pos.y - 20, player.attackDamage.toString(), '#ffffff');
               spawnParticles(e.pos.x, e.pos.y, '#ffffff', 5);
               state.screenShake = 4;
-              soundManager.playHit();
+              soundManager.playPlayerHit(); // Use PlayerHit for hit impact
             }
           }
         });
