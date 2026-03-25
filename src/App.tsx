@@ -656,9 +656,14 @@ export default function App() {
           <h1 className="text-5xl font-black tracking-tighter italic uppercase text-red-600 leading-none drop-shadow-md">
             DARK ZONE
           </h1>
-          <span className="text-xs uppercase tracking-[0.3em] text-zinc-500 font-bold mt-1">
-            Hashima Skirmish
-          </span>
+          <div className="flex items-center gap-3 mt-1">
+            <span className="text-xs uppercase tracking-[0.3em] text-zinc-500 font-bold">
+              Hashima Skirmish
+            </span>
+            <span className="bg-blue-600 text-white text-[10px] font-black px-2 py-0.5 rounded-full uppercase tracking-widest">
+              v1.0.2 (Blue Ally Patch)
+            </span>
+          </div>
         </div>
         <div className="flex gap-4 items-center">
           <div className="flex gap-6 items-center bg-zinc-900/80 px-6 py-2 rounded-2xl border-2 border-zinc-800">
