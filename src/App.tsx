@@ -1,0 +1,810 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
+import { Sword, Zap, Skull, Play, Trophy, ShieldAlert, Pause, RotateCcw } from 'lucide-react';
+import { PieceType, Team, Entity, Particle, DamageText, GameState, Wall } from './types';
+
+const CANVAS_WIDTH = 800;
+const CANVAS_HEIGHT = 600;
+const MAP_WIDTH = 1600;
+const MAP_HEIGHT = 1600;
+
+// Hashima Island (Gunkanjima) style ruined concrete map
+const INITIAL_WALLS: Wall[] = [
+  // Outer boundaries
+  { x: 0, y: 0, width: MAP_WIDTH, height: 60 },
+  { x: 0, y: MAP_HEIGHT - 60, width: MAP_WIDTH, height: 60 },
+  { x: 0, y: 0, width: 60, height: MAP_HEIGHT },
+  { x: MAP_WIDTH - 60, y: 0, width: 60, height: MAP_HEIGHT },
+  
+  // Ruined Buildings / Corridors
+  { x: 300, y: 300, width: 200, height: 150 },
+  { x: 1100, y: 300, width: 200, height: 150 },
+  { x: 600, y: 600, width: 400, height: 100 },
+  { x: 300, y: 1000, width: 150, height: 300 },
+  { x: 1150, y: 1000, width: 150, height: 300 },
+  { x: 700, y: 900, width: 200, height: 200 },
+];
+
+export default function App() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+  const [uiState, setUiState] = useState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
+  const requestRef = useRef<number>(null);
+  const keysPressed = useRef<Set<string>>(new Set());
+  const gameStateRef = useRef<GameState | null>(null);
+  
+  const isPlayingRef = useRef(false);
+  const isPausedRef = useRef(false);
+  const totalPausedTimeRef = useRef(0);
+  const pauseStartTimeRef = useRef(0);
+
+  const initGame = () => {
+    const player: Entity = {
+      id: 'player', type: PieceType.KING, team: Team.RED,
+      pos: { x: MAP_WIDTH / 2, y: MAP_HEIGHT - 200 },
+      hp: 300, maxHp: 300, speed: 5, radius: 24,
+      attackRange: 90, attackDamage: 40, attackCooldown: 400, lastAttackTime: 0,
+      skillCooldown: 6000, lastSkillTime: 0, isDead: false,
+      facingAngle: -Math.PI / 2, pushVelocity: { x: 0, y: 0 }, lastHitTime: 0,
+    };
+
+    const boss: Entity = {
+      id: 'boss', type: PieceType.KING, team: Team.BLUE,
+      pos: { x: MAP_WIDTH / 2, y: 200 },
+      hp: 1500, maxHp: 1500, speed: 2, radius: 35,
+      attackRange: 120, attackDamage: 50, attackCooldown: 1500, lastAttackTime: 0,
+      skillCooldown: 0, lastSkillTime: 0, isDead: false,
+      facingAngle: Math.PI / 2, pushVelocity: { x: 0, y: 0 }, lastHitTime: 0,
+    };
+
+    gameStateRef.current = {
+      player, allies: [], enemies: [boss], particles: [], damageTexts: [], walls: INITIAL_WALLS,
+      score: 0, gameOver: false, gameWon: false, screenShake: 0,
+    };
+    
+    // Initial guards
+    for(let i=0; i<8; i++) spawnEnemy(PieceType.PAWN);
+    for(let i=0; i<4; i++) spawnEnemy(PieceType.KNIGHT);
+    for(let i=0; i<2; i++) spawnEnemy(PieceType.ROOK);
+
+    setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
+    
+    totalPausedTimeRef.current = 0;
+    pauseStartTimeRef.current = 0;
+    isPausedRef.current = false;
+    setIsPaused(false);
+    isPlayingRef.current = true;
+    setIsPlaying(true);
+    
+    if (requestRef.current) cancelAnimationFrame(requestRef.current);
+    requestRef.current = requestAnimationFrame(update);
+  };
+
+  const togglePause = () => {
+    if (!isPlayingRef.current || gameStateRef.current?.gameOver || gameStateRef.current?.gameWon) return;
+    
+    isPausedRef.current = !isPausedRef.current;
+    setIsPaused(isPausedRef.current);
+    
+    if (isPausedRef.current) {
+      pauseStartTimeRef.current = Date.now();
+      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+    } else {
+      totalPausedTimeRef.current += Date.now() - pauseStartTimeRef.current;
+      requestRef.current = requestAnimationFrame(update);
+    }
+  };
+
+  const spawnEnemy = (type: PieceType) => {
+    const state = gameStateRef.current;
+    if (!state) return;
+    
+    // Spawn mostly in top half
+    let x = 100 + Math.random() * (MAP_WIDTH - 200);
+    let y = 100 + Math.random() * (MAP_HEIGHT / 2);
+    
+    let hp = 50, speed = 2, radius = 18, attackDamage = 15, attackRange = 50;
+    
+    if (type === PieceType.KNIGHT) { speed = 4; hp = 40; attackDamage = 20; }
+    if (type === PieceType.ROOK) { speed = 1.5; hp = 120; radius = 22; attackDamage = 30; attackRange = 60; }
+    if (type === PieceType.BISHOP) { speed = 2.5; hp = 60; attackDamage = 25; attackRange = 70; }
+
+    state.enemies.push({
+      id: Math.random().toString(36).substring(2, 9),
+      type, team: Team.BLUE, pos: { x, y }, hp, maxHp: hp, speed, radius,
+      attackRange, attackDamage, attackCooldown: 1200, lastAttackTime: 0,
+      skillCooldown: 0, lastSkillTime: 0, isDead: false,
+      facingAngle: Math.PI / 2, pushVelocity: { x: 0, y: 0 }, lastHitTime: 0,
+    });
+  };
+
+  const spawnParticles = (x: number, y: number, color: string, count: number) => {
+    const state = gameStateRef.current;
+    if (!state) return;
+    for (let i = 0; i < count; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = Math.random() * 5 + 2;
+      state.particles.push({
+        id: Math.random().toString(), pos: { x, y },
+        vel: { x: Math.cos(angle) * speed, y: Math.sin(angle) * speed },
+        color, life: 0, maxLife: 20 + Math.random() * 20, size: Math.random() * 5 + 2
+      });
+    }
+  };
+
+  const spawnDamageText = (x: number, y: number, text: string, color: string) => {
+    const state = gameStateRef.current;
+    if (!state) return;
+    state.damageTexts.push({
+      id: Math.random().toString(), pos: { x, y },
+      vel: { x: (Math.random() - 0.5) * 2, y: -2 - Math.random() * 2 },
+      text, color, life: 0, maxLife: 40
+    });
+  };
+
+  const resolveWallCollision = (entity: Entity, walls: Wall[]) => {
+    walls.forEach(w => {
+      let testX = entity.pos.x;
+      let testY = entity.pos.y;
+      
+      if (entity.pos.x < w.x) testX = w.x;
+      else if (entity.pos.x > w.x + w.width) testX = w.x + w.width;
+      if (entity.pos.y < w.y) testY = w.y;
+      else if (entity.pos.y > w.y + w.height) testY = w.y + w.height;
+
+      let distX = entity.pos.x - testX;
+      let distY = entity.pos.y - testY;
+      let distance = Math.sqrt(distX * distX + distY * distY);
+
+      if (distance < entity.radius) {
+        if (distance === 0) {
+          entity.pos.y -= entity.radius; // Push out arbitrarily if exactly inside
+        } else {
+          let pushDist = entity.radius - distance;
+          entity.pos.x += (distX / distance) * pushDist;
+          entity.pos.y += (distY / distance) * pushDist;
+        }
+      }
+    });
+  };
+
+  const updateAI = (entity: Entity, targets: Entity[], now: number) => {
+    // Boss behavior
+    if (entity.type === PieceType.KING && entity.team === Team.BLUE) {
+      if (Math.random() < 0.01 && gameStateRef.current!.enemies.length < 25) {
+        spawnEnemy(PieceType.PAWN);
+      }
+      if (Math.random() < 0.005 && gameStateRef.current!.enemies.length < 25) {
+        spawnEnemy(PieceType.KNIGHT);
+      }
+    }
+
+    let closest: Entity | null = null;
+    let minDist = Infinity;
+    targets.forEach(t => {
+      const d = Math.hypot(t.pos.x - entity.pos.x, t.pos.y - entity.pos.y);
+      if (d < minDist) { minDist = d; closest = t; }
+    });
+
+    if (closest) {
+      const angle = Math.atan2(closest.pos.y - entity.pos.y, closest.pos.x - entity.pos.x);
+      if (minDist > entity.attackRange - 5) {
+        entity.pos.x += Math.cos(angle) * entity.speed;
+        entity.pos.y += Math.sin(angle) * entity.speed;
+        entity.facingAngle = angle;
+      } else {
+        if (now - entity.lastAttackTime > entity.attackCooldown) {
+          entity.lastAttackTime = now;
+          closest.hp -= entity.attackDamage;
+          closest.lastHitTime = now;
+          closest.pushVelocity.x = Math.cos(angle) * 6;
+          closest.pushVelocity.y = Math.sin(angle) * 6;
+          spawnDamageText(closest.pos.x, closest.pos.y - 20, entity.attackDamage.toString(), entity.team === Team.RED ? '#3b82f6' : '#ef4444');
+          if (closest.id === 'player') gameStateRef.current!.screenShake = 5;
+        }
+      }
+    }
+  };
+
+  const update = () => {
+    if (!gameStateRef.current || gameStateRef.current.gameOver || gameStateRef.current.gameWon || isPausedRef.current) return;
+    const state = gameStateRef.current;
+    const { player, allies, enemies, particles, damageTexts, walls } = state;
+    const now = Date.now() - totalPausedTimeRef.current;
+
+    // Player Movement
+    let dx = 0; let dy = 0;
+    if (keysPressed.current.has('ArrowUp') || keysPressed.current.has('w') || keysPressed.current.has('W')) dy -= 1;
+    if (keysPressed.current.has('ArrowDown') || keysPressed.current.has('s') || keysPressed.current.has('S')) dy += 1;
+    if (keysPressed.current.has('ArrowLeft') || keysPressed.current.has('a') || keysPressed.current.has('A')) dx -= 1;
+    if (keysPressed.current.has('ArrowRight') || keysPressed.current.has('d') || keysPressed.current.has('D')) dx += 1;
+
+    if (dx !== 0 || dy !== 0) {
+      const mag = Math.sqrt(dx * dx + dy * dy);
+      player.pos.x += (dx / mag) * player.speed;
+      player.pos.y += (dy / mag) * player.speed;
+      player.facingAngle = Math.atan2(dy, dx);
+    }
+
+    // Apply knockback
+    player.pos.x += player.pushVelocity.x;
+    player.pos.y += player.pushVelocity.y;
+    player.pushVelocity.x *= 0.8;
+    player.pushVelocity.y *= 0.8;
+
+    resolveWallCollision(player, walls);
+
+    // Player Attack (Z or J)
+    if (keysPressed.current.has('z') || keysPressed.current.has('Z') || keysPressed.current.has('j') || keysPressed.current.has('J')) {
+      if (now - player.lastAttackTime > player.attackCooldown) {
+        player.lastAttackTime = now;
+        const attackSpread = Math.PI / 1.5; // 120 degrees
+        enemies.forEach(e => {
+          const edx = e.pos.x - player.pos.x;
+          const edy = e.pos.y - player.pos.y;
+          const dist = Math.hypot(edx, edy);
+          if (dist <= player.attackRange + e.radius) {
+            let angleToEnemy = Math.atan2(edy, edx);
+            let angleDiff = Math.abs(angleToEnemy - player.facingAngle);
+            while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+            angleDiff = Math.abs(angleDiff);
+            
+            if (angleDiff <= attackSpread / 2) {
+              e.hp -= player.attackDamage;
+              e.lastHitTime = now;
+              e.pushVelocity.x = Math.cos(angleToEnemy) * 10;
+              e.pushVelocity.y = Math.sin(angleToEnemy) * 10;
+              spawnDamageText(e.pos.x, e.pos.y - 20, player.attackDamage.toString(), '#ffffff');
+              spawnParticles(e.pos.x, e.pos.y, '#ffffff', 5);
+              state.screenShake = 4;
+            }
+          }
+        });
+      }
+    }
+
+    // Player Skill (X or K) - Dash & AoE
+    if (keysPressed.current.has('x') || keysPressed.current.has('X') || keysPressed.current.has('k') || keysPressed.current.has('K')) {
+      if (now - player.lastSkillTime > player.skillCooldown) {
+        player.lastSkillTime = now;
+        state.screenShake = 20;
+        
+        // Dash forward
+        player.pushVelocity.x = Math.cos(player.facingAngle) * 30;
+        player.pushVelocity.y = Math.sin(player.facingAngle) * 30;
+        
+        spawnParticles(player.pos.x, player.pos.y, '#ef4444', 40);
+        
+        enemies.forEach(e => {
+          const dist = Math.hypot(e.pos.x - player.pos.x, e.pos.y - player.pos.y);
+          if (dist < 200) {
+            e.hp -= 100;
+            e.lastHitTime = now;
+            const angle = Math.atan2(e.pos.y - player.pos.y, e.pos.x - player.pos.x);
+            e.pushVelocity.x = Math.cos(angle) * 20;
+            e.pushVelocity.y = Math.sin(angle) * 20;
+            spawnDamageText(e.pos.x, e.pos.y - 30, '100', '#ef4444');
+          }
+        });
+      }
+    }
+
+    // Update Allies
+    for (let i = allies.length - 1; i >= 0; i--) {
+      const ally = allies[i];
+      ally.pos.x += ally.pushVelocity.x;
+      ally.pos.y += ally.pushVelocity.y;
+      ally.pushVelocity.x *= 0.8;
+      ally.pushVelocity.y *= 0.8;
+      
+      updateAI(ally, enemies, now);
+      resolveWallCollision(ally, walls);
+
+      if (ally.hp <= 0) {
+        spawnParticles(ally.pos.x, ally.pos.y, '#ef4444', 15);
+        allies.splice(i, 1);
+      }
+    }
+
+    // Update Enemies
+    for (let i = enemies.length - 1; i >= 0; i--) {
+      const enemy = enemies[i];
+      enemy.pos.x += enemy.pushVelocity.x;
+      enemy.pos.y += enemy.pushVelocity.y;
+      enemy.pushVelocity.x *= 0.8;
+      enemy.pushVelocity.y *= 0.8;
+
+      updateAI(enemy, [player, ...allies], now);
+      resolveWallCollision(enemy, walls);
+
+      if (enemy.hp <= 0) {
+        state.score += (enemy.type === PieceType.KING ? 5000 : 100);
+        
+        if (enemy.type === PieceType.KING) {
+          state.gameWon = true;
+          spawnParticles(enemy.pos.x, enemy.pos.y, '#fbbf24', 100);
+        } else {
+          // SHOGI CAPTURE MECHANIC: Enemy becomes Ally
+          allies.push({
+            ...enemy,
+            id: Math.random().toString(),
+            team: Team.RED,
+            hp: enemy.maxHp, // Restore HP upon capture
+            isDead: false,
+            lastAttackTime: 0,
+            pushVelocity: { x: 0, y: 0 }
+          });
+          spawnParticles(enemy.pos.x, enemy.pos.y, '#ef4444', 25);
+          spawnDamageText(enemy.pos.x, enemy.pos.y - 40, "CAPTURED!", '#ef4444');
+        }
+        enemies.splice(i, 1);
+      }
+    }
+
+    // Update Particles & Texts
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.pos.x += p.vel.x; p.pos.y += p.vel.y; p.life++;
+      if (p.life >= p.maxLife) particles.splice(i, 1);
+    }
+    for (let i = damageTexts.length - 1; i >= 0; i--) {
+      const dt = damageTexts[i];
+      dt.pos.x += dt.vel.x; dt.pos.y += dt.vel.y; dt.life++;
+      if (dt.life >= dt.maxLife) damageTexts.splice(i, 1);
+    }
+
+    if (state.screenShake > 0) state.screenShake *= 0.9;
+    if (state.screenShake < 0.5) state.screenShake = 0;
+
+    if (player.hp <= 0) {
+      state.gameOver = true;
+      setIsPlaying(false);
+    }
+    if (state.gameWon) {
+      setIsPlaying(false);
+    }
+
+    const elapsed = now - player.lastSkillTime;
+    const skillPercent = Math.min(100, (elapsed / player.skillCooldown) * 100);
+    setUiState({ score: state.score, skillPercent, gameOver: state.gameOver, gameWon: state.gameWon, allyCount: allies.length });
+
+    draw(state, now);
+    requestRef.current = requestAnimationFrame(update);
+  };
+
+  const drawEntity = (ctx: CanvasRenderingContext2D, entity: Entity, now: number) => {
+    ctx.save();
+    ctx.translate(entity.pos.x, entity.pos.y);
+
+    const isHit = now - entity.lastHitTime < 100;
+    const isRed = entity.team === Team.RED;
+    const isBoss = entity.type === PieceType.KING && entity.team === Team.BLUE;
+    
+    let baseColor = isHit ? '#ffffff' : (isRed ? '#7f1d1d' : '#1e3a8a');
+    let topColor = isHit ? '#ffffff' : (isRed ? '#ef4444' : '#3b82f6');
+    
+    if (isBoss) {
+      baseColor = isHit ? '#ffffff' : '#312e81';
+      topColor = isHit ? '#ffffff' : '#4f46e5';
+    }
+
+    const height = entity.radius * 1.5;
+
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.beginPath();
+    ctx.ellipse(0, entity.radius * 0.8, entity.radius, entity.radius * 0.5, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = '#000000';
+
+    // Body (Cylinder)
+    ctx.fillStyle = baseColor;
+    ctx.beginPath();
+    ctx.arc(0, 0, entity.radius, 0, Math.PI);
+    ctx.lineTo(entity.radius, -height);
+    ctx.arc(0, -height, entity.radius, 0, Math.PI, true);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    // Top/Head
+    ctx.fillStyle = topColor;
+    ctx.beginPath();
+    ctx.arc(0, -height, entity.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // Visor/Face
+    ctx.save();
+    ctx.translate(0, -height);
+    ctx.rotate(entity.facingAngle);
+    ctx.fillStyle = isHit ? '#ff0000' : '#ffffff';
+    ctx.beginPath();
+    ctx.roundRect(entity.radius * 0.2, -entity.radius * 0.4, entity.radius * 0.6, entity.radius * 0.8, 4);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+
+    // Crown for Kings
+    if (entity.type === PieceType.KING) {
+      ctx.fillStyle = isRed ? '#fbbf24' : '#94a3b8';
+      ctx.beginPath();
+      ctx.moveTo(-entity.radius * 0.6, -height - entity.radius * 0.4);
+      ctx.lineTo(-entity.radius * 0.8, -height - entity.radius * 1.4);
+      ctx.lineTo(-entity.radius * 0.2, -height - entity.radius * 0.8);
+      ctx.lineTo(0, -height - entity.radius * 1.6);
+      ctx.lineTo(entity.radius * 0.2, -height - entity.radius * 0.8);
+      ctx.lineTo(entity.radius * 0.8, -height - entity.radius * 1.4);
+      ctx.lineTo(entity.radius * 0.6, -height - entity.radius * 0.4);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    // Piece Type Label
+    if (entity.type !== PieceType.KING) {
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 12px Inter';
+      ctx.textAlign = 'center';
+      ctx.fillText(entity.type[0], 0, -height + 4);
+    }
+
+    ctx.restore();
+
+    // Health Bar
+    const barWidth = entity.radius * 2.5;
+    const barHeight = isBoss ? 12 : 8;
+    ctx.save();
+    ctx.translate(entity.pos.x, entity.pos.y - entity.radius * 3.2);
+    
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(-barWidth/2 - 2, -barHeight/2 - 2, barWidth + 4, barHeight + 4);
+    
+    const fillPercent = Math.max(0, entity.hp / entity.maxHp);
+    ctx.fillStyle = isRed ? '#22c55e' : (isBoss ? '#a855f7' : '#ef4444');
+    ctx.fillRect(-barWidth/2, -barHeight/2, barWidth * fillPercent, barHeight);
+    
+    ctx.fillStyle = '#000000';
+    const segmentHP = isBoss ? 250 : 50;
+    const numSegments = Math.floor(entity.maxHp / segmentHP);
+    for (let i = 1; i < numSegments; i++) {
+      const segX = -barWidth/2 + (barWidth * (i * segmentHP) / entity.maxHp);
+      ctx.fillRect(segX - 1, -barHeight/2, 2, barHeight);
+    }
+    ctx.restore();
+  };
+
+  const draw = (state: GameState, now: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Camera logic: center on player, clamp to map bounds
+    let camX = state.player.pos.x - CANVAS_WIDTH / 2;
+    let camY = state.player.pos.y - CANVAS_HEIGHT / 2;
+    camX = Math.max(0, Math.min(MAP_WIDTH - CANVAS_WIDTH, camX));
+    camY = Math.max(0, Math.min(MAP_HEIGHT - CANVAS_HEIGHT, camY));
+
+    ctx.save();
+    
+    // Screen Shake
+    if (state.screenShake > 0) {
+      const dx = (Math.random() - 0.5) * state.screenShake;
+      const dy = (Math.random() - 0.5) * state.screenShake;
+      ctx.translate(dx, dy);
+    }
+
+    // Background (Ocean/Abyss outside map)
+    ctx.fillStyle = '#050505';
+    ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+    // Apply Camera Transform
+    ctx.translate(-camX, -camY);
+
+    // Draw Hashima Island Floor
+    ctx.fillStyle = '#27272a'; // Dark concrete
+    ctx.fillRect(0, 0, MAP_WIDTH, MAP_HEIGHT);
+
+    // Grid lines for tactical feel
+    ctx.strokeStyle = '#3f3f46';
+    ctx.lineWidth = 2;
+    for (let i = 0; i < MAP_WIDTH; i += 100) {
+      ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, MAP_HEIGHT); ctx.stroke();
+    }
+    for (let i = 0; i < MAP_HEIGHT; i += 100) {
+      ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(MAP_WIDTH, i); ctx.stroke();
+    }
+
+    // Draw Walls (Fake 3D)
+    state.walls.forEach(w => {
+      // Top face
+      ctx.fillStyle = '#52525b';
+      ctx.fillRect(w.x, w.y - 40, w.width, w.height);
+      // Front face
+      ctx.fillStyle = '#18181b';
+      ctx.fillRect(w.x, w.y + w.height - 40, w.width, 40);
+      
+      ctx.strokeStyle = '#000000';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(w.x, w.y - 40, w.width, w.height);
+      ctx.strokeRect(w.x, w.y + w.height - 40, w.width, 40);
+    });
+
+    // Sort entities by Y for fake 3D depth
+    const allEntities = [state.player, ...state.allies, ...state.enemies].sort((a, b) => a.pos.y - b.pos.y);
+    allEntities.forEach(e => drawEntity(ctx, e, now));
+
+    // Attack Arc
+    if (now - state.player.lastAttackTime < 150) {
+      ctx.save();
+      ctx.translate(state.player.pos.x, state.player.pos.y);
+      ctx.rotate(state.player.facingAngle);
+      ctx.beginPath();
+      ctx.arc(0, 0, state.player.attackRange, -Math.PI / 3, Math.PI / 3);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
+      ctx.lineWidth = 15;
+      ctx.lineCap = 'round';
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // Skill Effect
+    if (now - state.player.lastSkillTime < 400) {
+      const progress = (now - state.player.lastSkillTime) / 400;
+      ctx.beginPath();
+      ctx.arc(state.player.pos.x, state.player.pos.y, 200 * progress, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(239, 68, 68, ${1 - progress})`;
+      ctx.lineWidth = 15 * (1 - progress);
+      ctx.stroke();
+      ctx.fillStyle = `rgba(239, 68, 68, ${(1 - progress) * 0.2})`;
+      ctx.fill();
+    }
+
+    // Particles
+    state.particles.forEach(p => {
+      ctx.fillStyle = p.color;
+      ctx.globalAlpha = 1 - (p.life / p.maxLife);
+      ctx.beginPath();
+      ctx.arc(p.pos.x, p.pos.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1.0;
+    });
+
+    // Damage Texts
+    state.damageTexts.forEach(dt => {
+      ctx.fillStyle = dt.color;
+      ctx.globalAlpha = 1 - (dt.life / dt.maxLife);
+      ctx.font = 'black italic 22px Inter';
+      ctx.textAlign = 'center';
+      ctx.strokeStyle = '#000000';
+      ctx.lineWidth = 5;
+      ctx.strokeText(dt.text, dt.pos.x, dt.pos.y);
+      ctx.fillText(dt.text, dt.pos.x, dt.pos.y);
+      ctx.globalAlpha = 1.0;
+    });
+
+    ctx.restore();
+  };
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
+        e.preventDefault();
+      }
+      if (e.key === 'Escape' || e.key.toLowerCase() === 'p') {
+        togglePause();
+      }
+      keysPressed.current.add(e.key);
+    };
+    const handleKeyUp = (e: KeyboardEvent) => keysPressed.current.delete(e.key);
+    const handleBlur = () => keysPressed.current.clear();
+
+    window.addEventListener('keydown', handleKeyDown, { passive: false });
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleBlur);
+    
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleBlur);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (isPlaying && !isPausedRef.current) {
+      requestRef.current = requestAnimationFrame(update);
+    }
+    return () => {
+      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+    };
+  }, [isPlaying]);
+
+  return (
+    <div className="min-h-screen bg-[#050505] text-white font-sans flex flex-col items-center justify-center p-4 select-none">
+      {/* Header */}
+      <div className="w-full max-w-[800px] flex justify-between items-center mb-4 px-2">
+        <div className="flex flex-col">
+          <h1 className="text-5xl font-black tracking-tighter italic uppercase text-red-600 leading-none drop-shadow-md">
+            DARK ZONE
+          </h1>
+          <span className="text-xs uppercase tracking-[0.3em] text-zinc-500 font-bold mt-1">
+            Hashima Skirmish
+          </span>
+        </div>
+        <div className="flex gap-4 items-center">
+          <div className="flex gap-6 items-center bg-zinc-900/80 px-6 py-2 rounded-2xl border-2 border-zinc-800">
+            <div className="flex flex-col items-end">
+              <span className="text-[10px] uppercase text-zinc-500 font-black tracking-wider">Score</span>
+              <span className="text-2xl font-black italic text-white">{uiState.score}</span>
+            </div>
+            <div className="w-px h-8 bg-zinc-800"></div>
+            <div className="flex flex-col items-end">
+              <span className="text-[10px] uppercase text-zinc-500 font-black tracking-wider">Red Army</span>
+              <span className="text-2xl font-black italic text-red-500">{uiState.allyCount}</span>
+            </div>
+          </div>
+          
+          {/* Controls */}
+          <div className="flex gap-2">
+            <button 
+              onClick={togglePause} 
+              disabled={!isPlaying || uiState.gameOver || uiState.gameWon}
+              className="p-3 bg-zinc-900/80 rounded-2xl border-2 border-zinc-800 hover:bg-zinc-800 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Pause (P or Esc)"
+            >
+              {isPaused ? <Play className="w-6 h-6" /> : <Pause className="w-6 h-6" />}
+            </button>
+            <button 
+              onClick={initGame} 
+              className="p-3 bg-zinc-900/80 rounded-2xl border-2 border-zinc-800 hover:bg-red-900/50 hover:border-red-800 text-white transition-colors"
+              title="Restart"
+            >
+              <RotateCcw className="w-6 h-6" />
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Game Canvas Container */}
+      <div 
+        className="relative border-8 border-zinc-900 rounded-3xl overflow-hidden shadow-[0_0_50px_rgba(220,38,38,0.15)]"
+        onClick={() => window.focus()}
+      >
+        <canvas
+          ref={canvasRef}
+          width={CANVAS_WIDTH}
+          height={CANVAS_HEIGHT}
+          className="bg-black block"
+        />
+
+        {/* Pause Overlay */}
+        <AnimatePresence>
+          {isPaused && !uiState.gameOver && !uiState.gameWon && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-black/60 backdrop-blur-sm flex flex-col items-center justify-center z-40"
+            >
+              <h2 className="text-5xl font-black italic uppercase mb-8 text-white tracking-widest drop-shadow-lg">Paused</h2>
+              <div className="flex gap-4">
+                <button
+                  onClick={togglePause}
+                  className="bg-zinc-100 hover:bg-white text-black font-black italic text-xl uppercase px-8 py-4 rounded-2xl transition-all flex items-center justify-center gap-3 border-b-4 border-zinc-400 active:border-b-0 active:translate-y-1"
+                >
+                  <Play className="w-6 h-6 fill-current" />
+                  Resume
+                </button>
+                <button
+                  onClick={initGame}
+                  className="bg-red-600 hover:bg-red-500 text-white font-black italic text-xl uppercase px-8 py-4 rounded-2xl transition-all flex items-center justify-center gap-3 border-b-4 border-red-800 active:border-b-0 active:translate-y-1"
+                >
+                  <RotateCcw className="w-6 h-6" />
+                  Restart
+                </button>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Start / Game Over Overlay */}
+        <AnimatePresence>
+          {!isPlaying && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-black/80 backdrop-blur-md flex flex-col items-center justify-center z-50"
+            >
+              <motion.div
+                initial={{ scale: 0.8, y: 20 }}
+                animate={{ scale: 1, y: 0 }}
+                className="bg-zinc-900 p-10 rounded-3xl border-4 border-zinc-800 shadow-2xl text-center max-w-md w-full"
+              >
+                {uiState.gameOver ? (
+                  <>
+                    <Skull className="w-20 h-20 text-red-600 mx-auto mb-4 drop-shadow-[0_0_15px_rgba(220,38,38,0.5)]" />
+                    <h2 className="text-4xl font-black italic uppercase mb-2 text-white">Checkmate</h2>
+                    <p className="text-zinc-400 mb-8 font-bold uppercase tracking-widest text-sm">The Red King has fallen</p>
+                  </>
+                ) : uiState.gameWon ? (
+                  <>
+                    <Trophy className="w-20 h-20 text-yellow-500 mx-auto mb-4 drop-shadow-[0_0_15px_rgba(234,179,8,0.5)]" />
+                    <h2 className="text-4xl font-black italic uppercase mb-2 text-white">Victory!</h2>
+                    <p className="text-zinc-400 mb-8 font-bold uppercase tracking-widest text-sm">The Blue King is defeated</p>
+                  </>
+                ) : (
+                  <>
+                    <ShieldAlert className="w-20 h-20 text-red-600 mx-auto mb-4 drop-shadow-[0_0_15px_rgba(220,38,38,0.5)]" />
+                    <h2 className="text-4xl font-black italic uppercase mb-2 text-white">Enter the Zone</h2>
+                    <p className="text-zinc-400 mb-8 font-bold uppercase tracking-widest text-sm">Capture enemies to build your army</p>
+                  </>
+                )}
+
+                <button
+                  onClick={initGame}
+                  className="w-full bg-red-600 hover:bg-red-500 text-white font-black italic text-xl uppercase py-5 rounded-2xl transition-all flex items-center justify-center gap-3 group border-b-4 border-red-800 active:border-b-0 active:translate-y-1"
+                >
+                  <Play className="w-6 h-6 fill-current" />
+                  {uiState.gameOver || uiState.gameWon ? 'Play Again' : 'Start Battle'}
+                </button>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* In-game HUD */}
+        {isPlaying && (
+          <div className="absolute bottom-6 right-6 flex gap-4 pointer-events-none">
+            <div className="flex flex-col items-center">
+              <div className="w-20 h-20 rounded-full bg-zinc-900/90 border-4 border-zinc-700 flex items-center justify-center relative overflow-hidden shadow-lg">
+                <Sword className="w-10 h-10 text-zinc-300" />
+                <div className="absolute bottom-1 text-[12px] font-black italic text-zinc-500">Z</div>
+              </div>
+              <span className="text-[12px] uppercase font-black tracking-widest mt-2 text-zinc-400 drop-shadow-md">Attack</span>
+            </div>
+
+            <div className="flex flex-col items-center">
+              <div className="w-20 h-20 rounded-full bg-zinc-900/90 border-4 border-zinc-700 flex items-center justify-center relative overflow-hidden shadow-lg">
+                <Zap className={`w-10 h-10 ${uiState.skillPercent >= 100 ? 'text-yellow-500 fill-yellow-500' : 'text-zinc-600'}`} />
+                <div 
+                  className="absolute inset-0 bg-black/70 transition-all duration-100"
+                  style={{ height: `${100 - uiState.skillPercent}%` }}
+                />
+                <div className="absolute bottom-1 text-[12px] font-black italic text-zinc-500 z-10">X</div>
+              </div>
+              <span className="text-[12px] uppercase font-black tracking-widest mt-2 text-zinc-400 drop-shadow-md">Dash</span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Controls Help */}
+      <div className="mt-8 grid grid-cols-3 gap-6 text-center max-w-[800px] w-full">
+        <div className="bg-zinc-900/80 p-5 rounded-3xl border-2 border-zinc-800 flex flex-col items-center shadow-lg">
+          <span className="block text-[11px] uppercase text-zinc-400 font-black tracking-widest mb-3">Move</span>
+          <div className="flex flex-col items-center gap-1">
+            <kbd className="w-10 h-10 flex items-center justify-center bg-zinc-800 rounded-xl text-lg font-black border-b-4 border-zinc-950 text-white">↑</kbd>
+            <div className="flex gap-1">
+              <kbd className="w-10 h-10 flex items-center justify-center bg-zinc-800 rounded-xl text-lg font-black border-b-4 border-zinc-950 text-white">←</kbd>
+              <kbd className="w-10 h-10 flex items-center justify-center bg-zinc-800 rounded-xl text-lg font-black border-b-4 border-zinc-950 text-white">↓</kbd>
+              <kbd className="w-10 h-10 flex items-center justify-center bg-zinc-800 rounded-xl text-lg font-black border-b-4 border-zinc-950 text-white">→</kbd>
+            </div>
+          </div>
+        </div>
+        <div className="bg-zinc-900/80 p-5 rounded-3xl border-2 border-zinc-800 flex flex-col items-center justify-center shadow-lg">
+          <span className="block text-[11px] uppercase text-zinc-400 font-black tracking-widest mb-3">Attack</span>
+          <kbd className="w-16 h-16 flex items-center justify-center bg-red-900/50 rounded-2xl text-2xl font-black italic border-b-4 border-red-950 text-red-500">Z</kbd>
+        </div>
+        <div className="bg-zinc-900/80 p-5 rounded-3xl border-2 border-zinc-800 flex flex-col items-center justify-center shadow-lg">
+          <span className="block text-[11px] uppercase text-zinc-400 font-black tracking-widest mb-3">Skill (Dash)</span>
+          <kbd className="w-16 h-16 flex items-center justify-center bg-yellow-900/50 rounded-2xl text-2xl font-black italic border-b-4 border-yellow-950 text-yellow-500">X</kbd>
+        </div>
+      </div>
+    </div>
+  );
+}
