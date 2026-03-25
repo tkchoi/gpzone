@@ -51,12 +51,16 @@ export default function App() {
   const TIME_STEP = 1000 / 60; // 60 FPS fixed timestep
 
   const initGame = () => {
+    keysPressed.current.clear();
+    joystickRef.current = { x: 0, y: 0 };
+    setJoystick({ active: false, x: 0, y: 0, startX: 0, startY: 0 });
+
     const player: Entity = {
       id: 'player', type: PieceType.KING, team: Team.BLUE,
       pos: { x: MAP_WIDTH / 2, y: MAP_HEIGHT - 200 },
       hp: 300, maxHp: 300, speed: 5, radius: 24,
       attackRange: 90, attackDamage: 40, attackCooldown: 400, lastAttackTime: 0,
-      skillCooldown: 4000, lastSkillTime: 0, isDead: false,
+      skillCooldown: 4000, lastSkillTime: Date.now(), isDead: false,
       facingAngle: -Math.PI / 2, pushVelocity: { x: 0, y: 0 }, lastHitTime: 0,
     };
 
@@ -920,7 +924,7 @@ export default function App() {
           ref={canvasRef}
           width={CANVAS_WIDTH}
           height={CANVAS_HEIGHT}
-          className={isMobile ? "max-w-full max-h-full object-contain shadow-2xl" : "bg-black block"}
+          className={isMobile ? "w-full h-full object-cover shadow-2xl" : "bg-black block"}
           onClick={() => {
             if (!isPlaying && !uiState.gameOver && !uiState.gameWon) initGame();
             if (!isMobile) window.focus();
@@ -932,7 +936,7 @@ export default function App() {
           <div className="absolute inset-0 pointer-events-none">
             {/* Joystick Area */}
             <div 
-              className="absolute bottom-6 left-6 w-36 h-36 flex items-center justify-center pointer-events-auto"
+              className="absolute bottom-6 left-2 w-36 h-36 flex items-center justify-center pointer-events-auto"
               onTouchStart={handleJoystickStart}
               onTouchMove={handleJoystickMove}
               onTouchEnd={handleJoystickEnd}
