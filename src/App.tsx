@@ -359,15 +359,16 @@ export default function App() {
     if (keysPressed.current.has('ArrowLeft') || keysPressed.current.has('a') || keysPressed.current.has('A')) dx -= 1;
     if (keysPressed.current.has('ArrowRight') || keysPressed.current.has('d') || keysPressed.current.has('D')) dx += 1;
 
+    const currentSpeed = isMobile ? player.speed * 1.5 : player.speed;
     if (dx !== 0 || dy !== 0) {
       const mag = Math.sqrt(dx * dx + dy * dy);
-      player.pos.x += (dx / mag) * player.speed;
-      player.pos.y += (dy / mag) * player.speed;
+      player.pos.x += (dx / mag) * currentSpeed;
+      player.pos.y += (dy / mag) * currentSpeed;
       player.facingAngle = Math.atan2(dy, dx);
     } else if (joystickRef.current.x !== 0 || joystickRef.current.y !== 0) {
       // Mobile Joystick Movement
-      player.pos.x += joystickRef.current.x * player.speed;
-      player.pos.y += joystickRef.current.y * player.speed;
+      player.pos.x += joystickRef.current.x * currentSpeed;
+      player.pos.y += joystickRef.current.y * currentSpeed;
       player.facingAngle = Math.atan2(joystickRef.current.y, joystickRef.current.x);
     }
 
@@ -931,16 +932,16 @@ export default function App() {
           <div className="absolute inset-0 pointer-events-none">
             {/* Joystick Area */}
             <div 
-              className="absolute bottom-8 left-8 w-48 h-48 flex items-center justify-center pointer-events-auto"
+              className="absolute bottom-6 left-6 w-36 h-36 flex items-center justify-center pointer-events-auto"
               onTouchStart={handleJoystickStart}
               onTouchMove={handleJoystickMove}
               onTouchEnd={handleJoystickEnd}
             >
-              <div className="w-32 h-32 rounded-full bg-white/10 border-2 border-white/20 flex items-center justify-center backdrop-blur-sm">
-                <div className="w-16 h-16 rounded-full bg-white/5 border border-white/10" />
+              <div className="w-24 h-24 rounded-full bg-white/10 border-2 border-white/20 flex items-center justify-center backdrop-blur-sm">
+                <div className="w-12 h-12 rounded-full bg-white/5 border border-white/10" />
                 {joystick.active && (
                   <motion.div 
-                    className="absolute w-16 h-16 rounded-full bg-white/40 shadow-[0_0_20px_rgba(255,255,255,0.3)] border border-white/50"
+                    className="absolute w-12 h-12 rounded-full bg-white/40 shadow-[0_0_20px_rgba(255,255,255,0.3)] border border-white/50"
                     style={{ x: joystick.x, y: joystick.y }}
                   />
                 )}
@@ -948,31 +949,31 @@ export default function App() {
             </div>
 
             {/* Action Buttons Area */}
-            <div className="absolute bottom-8 right-8 flex items-end gap-6 pointer-events-auto">
-              {/* Skill Button */}
-              <div className="flex flex-col items-center gap-2">
+            <div className="absolute bottom-6 right-6 w-48 h-48 pointer-events-auto">
+              {/* Attack Button */}
+              <div className="absolute bottom-0 right-0 flex flex-col items-center gap-1">
                 <button 
-                  className="w-20 h-20 rounded-full bg-blue-600/60 border-2 border-blue-400/40 flex items-center justify-center shadow-lg active:scale-90 transition-transform backdrop-blur-sm relative overflow-hidden"
+                  className="w-20 h-20 rounded-full bg-red-600/70 border-2 border-red-400/50 flex items-center justify-center shadow-[0_0_30px_rgba(220,38,38,0.3)] active:scale-90 transition-transform backdrop-blur-sm"
+                  onTouchStart={(e) => { e.preventDefault(); triggerAttack(); }}
+                >
+                  <Sword className="w-10 h-10 text-white" />
+                </button>
+                <span className="text-[8px] font-black italic text-red-500 tracking-widest drop-shadow-md">ATTACK</span>
+              </div>
+
+              {/* Skill Button */}
+              <div className="absolute bottom-12 right-24 flex flex-col items-center gap-1">
+                <button 
+                  className="w-16 h-16 rounded-full bg-blue-600/60 border-2 border-blue-400/40 flex items-center justify-center shadow-lg active:scale-90 transition-transform backdrop-blur-sm relative overflow-hidden"
                   onTouchStart={(e) => { e.preventDefault(); triggerSkill(); }}
                 >
-                  <Zap className={`w-10 h-10 ${uiState.skillPercent >= 100 ? 'text-white fill-white animate-pulse' : 'text-blue-200/50'}`} />
+                  <Zap className={`w-8 h-8 ${uiState.skillPercent >= 100 ? 'text-white fill-white animate-pulse' : 'text-blue-200/50'}`} />
                   <div 
                     className="absolute inset-0 bg-black/40 transition-all duration-100"
                     style={{ height: `${100 - uiState.skillPercent}%` }}
                   />
                 </button>
-                <span className="text-[10px] font-black italic text-blue-400 tracking-widest drop-shadow-md">DASH</span>
-              </div>
-
-              {/* Attack Button */}
-              <div className="flex flex-col items-center gap-2">
-                <button 
-                  className="w-28 h-28 rounded-full bg-red-600/70 border-2 border-red-400/50 flex items-center justify-center shadow-[0_0_30px_rgba(220,38,38,0.3)] active:scale-90 transition-transform backdrop-blur-sm"
-                  onTouchStart={(e) => { e.preventDefault(); triggerAttack(); }}
-                >
-                  <Sword className="w-14 h-14 text-white" />
-                </button>
-                <span className="text-[10px] font-black italic text-red-500 tracking-widest drop-shadow-md">ATTACK</span>
+                <span className="text-[8px] font-black italic text-blue-400 tracking-widest drop-shadow-md">DASH</span>
               </div>
             </div>
           </div>
