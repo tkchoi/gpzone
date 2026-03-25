@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+// Version: 1.0.1 - Force GitHub Sync (Color & Speed Fixes)
 import { motion, AnimatePresence } from 'motion/react';
 import { Sword, Zap, Skull, Play, Trophy, ShieldAlert, Pause, RotateCcw } from 'lucide-react';
 import { PieceType, Team, Entity, Particle, DamageText, GameState, Wall } from './types';
