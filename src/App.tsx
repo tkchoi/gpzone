@@ -3,6 +3,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Sword, Zap, Skull, Play, Trophy, ShieldAlert, Pause, RotateCcw } from 'lucide-react';
 import { PieceType, Team, Entity, Particle, DamageText, GameState, Wall } from './types';
+import { soundManager } from './SoundManager';
 
 const CANVAS_WIDTH = 800;
 const CANVAS_HEIGHT = 600;
@@ -50,7 +51,7 @@ export default function App() {
       pos: { x: MAP_WIDTH / 2, y: MAP_HEIGHT - 200 },
       hp: 300, maxHp: 300, speed: 5, radius: 24,
       attackRange: 90, attackDamage: 40, attackCooldown: 400, lastAttackTime: 0,
-      skillCooldown: 6000, lastSkillTime: 0, isDead: false,
+      skillCooldown: 4000, lastSkillTime: 0, isDead: false,
       facingAngle: -Math.PI / 2, pushVelocity: { x: 0, y: 0 }, lastHitTime: 0,
     };
 
@@ -59,7 +60,7 @@ export default function App() {
       pos: { x: MAP_WIDTH / 2, y: 200 },
       hp: 1500, maxHp: 1500, speed: 2, radius: 35,
       attackRange: 120, attackDamage: 50, attackCooldown: 1500, lastAttackTime: 0,
-      skillCooldown: 0, lastSkillTime: 0, isDead: false,
+      skillCooldown: 5000, lastSkillTime: 0, isDead: false,
       facingAngle: Math.PI / 2, pushVelocity: { x: 0, y: 0 }, lastHitTime: 0,
     };
 
@@ -83,6 +84,7 @@ export default function App() {
     setIsPaused(false);
     isPlayingRef.current = true;
     setIsPlaying(true);
+    soundManager.startBGM();
     
     if (requestRef.current) cancelAnimationFrame(requestRef.current);
     requestRef.current = requestAnimationFrame(update);
@@ -176,29 +178,129 @@ export default function App() {
   };
 
   const updateAI = (entity: Entity, targets: Entity[], now: number) => {
+    const isBoss = entity.id === 'boss';
+    const state = gameStateRef.current!;
+
     // Boss behavior
     if (entity.type === PieceType.KING && entity.team === Team.RED) {
-      if (Math.random() < 0.01 && gameStateRef.current!.enemies.length < 25) {
-        spawnEnemy(PieceType.PAWN);
+      const distToPlayer = Math.hypot(state.player.pos.x - entity.pos.x, state.player.pos.y - entity.pos.y);
+      
+      // Berserk Mode: Faster and more aggressive when low HP
+      const isBerserk = entity.hp < entity.maxHp * 0.4;
+      const currentSpeed = isBerserk ? entity.speed * 1.5 : entity.speed;
+      const currentCooldown = isBerserk ? entity.attackCooldown * 0.7 : entity.attackCooldown;
+
+      if (Math.random() < 0.02 && state.enemies.length < 30) spawnEnemy(PieceType.PAWN);
+      if (Math.random() < 0.01 && state.enemies.length < 30) spawnEnemy(PieceType.KNIGHT);
+
+      // BOSS SKILLS
+      const skillCD = isBerserk ? entity.skillCooldown * 0.6 : entity.skillCooldown;
+      if (now - entity.lastSkillTime > skillCD) {
+        // Priority 1: Charge at player if in range
+        if (distToPlayer > 150 && distToPlayer < 600) {
+          entity.lastSkillTime = now;
+          const angle = Math.atan2(state.player.pos.y - entity.pos.y, state.player.pos.x - entity.pos.x);
+          entity.pushVelocity.x = Math.cos(angle) * (isBerserk ? 35 : 25);
+          entity.pushVelocity.y = Math.sin(angle) * (isBerserk ? 35 : 25);
+          spawnParticles(entity.pos.x, entity.pos.y, '#ef4444', 40);
+          spawnDamageText(entity.pos.x, entity.pos.y - 50, isBerserk ? "BERSERK CHARGE!" : "CHARGE!", '#ef4444');
+          state.screenShake = 20;
+          soundManager.playBossSkill();
+        } 
+        // Priority 2: Corruption Nova if allies are nearby
+        else if (state.allies.length > 0) {
+          const corruptionRange = 350;
+          let corruptedCount = 0;
+          for (let i = state.allies.length - 1; i >= 0; i--) {
+            const ally = state.allies[i];
+            if (Math.hypot(ally.pos.x - entity.pos.x, ally.pos.y - entity.pos.y) < corruptionRange) {
+              entity.lastSkillTime = now;
+              ally.team = Team.RED;
+              ally.hp = ally.maxHp;
+              state.enemies.push(ally);
+              state.allies.splice(i, 1);
+              spawnParticles(ally.pos.x, ally.pos.y, '#ef4444', 20);
+              corruptedCount++;
+            }
+          }
+          if (corruptedCount > 0) {
+            spawnDamageText(entity.pos.x, entity.pos.y - 50, "CORRUPTION NOVA!", '#ef4444');
+            state.screenShake = 15;
+            soundManager.playBossSkill();
+          }
+        }
       }
-      if (Math.random() < 0.005 && gameStateRef.current!.enemies.length < 25) {
-        spawnEnemy(PieceType.KNIGHT);
+
+      // Movement logic for Boss
+      let target = state.player;
+      let minDist = distToPlayer;
+
+      // If player is too far or dead, find closest ally
+      if (state.player.isDead || distToPlayer > 1000) {
+        state.allies.forEach(a => {
+          const d = Math.hypot(a.pos.x - entity.pos.x, a.pos.y - entity.pos.y);
+          if (d < minDist) { minDist = d; target = a; }
+        });
       }
+
+      const angle = Math.atan2(target.pos.y - entity.pos.y, target.pos.x - entity.pos.x);
+      
+      // Aggressive Pursuit
+      if (minDist > entity.attackRange - 20) {
+        let moveAngle = angle;
+        
+        // Strafing to avoid being a sitting duck
+        const strafeFactor = Math.sin(now / 400) * 0.5;
+        moveAngle += strafeFactor;
+
+        entity.pos.x += Math.cos(moveAngle) * currentSpeed;
+        entity.pos.y += Math.sin(moveAngle) * currentSpeed;
+        entity.facingAngle = angle;
+      } else {
+        // Attack
+        if (now - entity.lastAttackTime > currentCooldown) {
+          entity.lastAttackTime = now;
+          target.hp -= entity.attackDamage;
+          target.lastHitTime = now;
+          const pushAngle = Math.atan2(target.pos.y - entity.pos.y, target.pos.x - entity.pos.x);
+          target.pushVelocity.x = Math.cos(pushAngle) * 10;
+          target.pushVelocity.y = Math.sin(pushAngle) * 10;
+          spawnDamageText(target.pos.x, target.pos.y - 30, entity.attackDamage.toString(), '#ef4444');
+          soundManager.playHit();
+        }
+      }
+
+      // Wall Avoidance: If too close to edge, push back towards center
+      const margin = 100;
+      if (entity.pos.x < margin) entity.pushVelocity.x += 2;
+      if (entity.pos.x > MAP_WIDTH - margin) entity.pushVelocity.x -= 2;
+      if (entity.pos.y < margin) entity.pushVelocity.y += 2;
+      if (entity.pos.y > MAP_HEIGHT - margin) entity.pushVelocity.y -= 2;
+
+    return; // Boss logic handled
     }
 
     let closest: Entity | null = null;
     let minDist = Infinity;
-    targets.forEach(t => {
-      const d = Math.hypot(t.pos.x - entity.pos.x, t.pos.y - entity.pos.y);
-      if (d < minDist) { minDist = d; closest = t; }
-    });
+
+    if (!closest) {
+      targets.forEach(t => {
+        const d = Math.hypot(t.pos.x - entity.pos.x, t.pos.y - entity.pos.y);
+        if (d < minDist) { minDist = d; closest = t; }
+      });
+    }
 
     if (closest) {
-      const angle = Math.atan2(closest.pos.y - entity.pos.y, closest.pos.x - entity.pos.x);
-      if (minDist > entity.attackRange - 5) {
-        entity.pos.x += Math.cos(angle) * entity.speed;
-        entity.pos.y += Math.sin(angle) * entity.speed;
-        entity.facingAngle = angle;
+      let targetPos = { ...closest.pos };
+      
+      const angle = Math.atan2(targetPos.y - entity.pos.y, targetPos.x - entity.pos.x);
+      
+      if (minDist > entity.attackRange - 10) {
+        let moveAngle = angle;
+        
+        entity.pos.x += Math.cos(moveAngle) * entity.speed;
+        entity.pos.y += Math.sin(moveAngle) * entity.speed;
+        entity.facingAngle = angle; // Still face the target
       } else {
         if (now - entity.lastAttackTime > entity.attackCooldown) {
           entity.lastAttackTime = now;
@@ -207,7 +309,10 @@ export default function App() {
           closest.pushVelocity.x = Math.cos(angle) * 6;
           closest.pushVelocity.y = Math.sin(angle) * 6;
           spawnDamageText(closest.pos.x, closest.pos.y - 20, entity.attackDamage.toString(), entity.team === Team.BLUE ? '#3b82f6' : '#ef4444');
-          if (closest.id === 'player') gameStateRef.current!.screenShake = 5;
+          if (closest.id === 'player') {
+            state.screenShake = 5;
+            soundManager.playHit();
+          }
         }
       }
     }
@@ -264,35 +369,58 @@ export default function App() {
               spawnDamageText(e.pos.x, e.pos.y - 20, player.attackDamage.toString(), '#ffffff');
               spawnParticles(e.pos.x, e.pos.y, '#ffffff', 5);
               state.screenShake = 4;
+              soundManager.playHit();
             }
           }
         });
       }
     }
 
-    // Player Skill (X or K) - Dash & AoE
+    // Player Skill (X or K) - Conversion Dash
     if (keysPressed.current.has('x') || keysPressed.current.has('X') || keysPressed.current.has('k') || keysPressed.current.has('K')) {
       if (now - player.lastSkillTime > player.skillCooldown) {
         player.lastSkillTime = now;
-        state.screenShake = 20;
+        state.screenShake = 25;
+        soundManager.playSkill();
         
         // Dash forward
-        player.pushVelocity.x = Math.cos(player.facingAngle) * 30;
-        player.pushVelocity.y = Math.sin(player.facingAngle) * 30;
+        player.pushVelocity.x = Math.cos(player.facingAngle) * 45;
+        player.pushVelocity.y = Math.sin(player.facingAngle) * 45;
         
-        spawnParticles(player.pos.x, player.pos.y, '#ef4444', 40);
+        spawnParticles(player.pos.x, player.pos.y, '#3b82f6', 50);
         
-        enemies.forEach(e => {
-          const dist = Math.hypot(e.pos.x - player.pos.x, e.pos.y - player.pos.y);
-          if (dist < 200) {
-            e.hp -= 100;
-            e.lastHitTime = now;
-            const angle = Math.atan2(e.pos.y - player.pos.y, e.pos.x - player.pos.x);
-            e.pushVelocity.x = Math.cos(angle) * 20;
-            e.pushVelocity.y = Math.sin(angle) * 20;
-            spawnDamageText(e.pos.x, e.pos.y - 30, '100', '#ef4444');
+        const conversionRange = 300; // Increased range
+        let convertedCount = 0;
+
+        for (let i = enemies.length - 1; i >= 0; i--) {
+          const enemy = enemies[i];
+          if (enemy.id === 'boss') {
+            // Boss takes massive damage instead of conversion
+            const dist = Math.hypot(enemy.pos.x - player.pos.x, enemy.pos.y - player.pos.y);
+            if (dist < conversionRange) {
+              enemy.hp -= 300;
+              enemy.lastHitTime = now;
+              spawnDamageText(enemy.pos.x, enemy.pos.y - 50, '300', '#ef4444');
+            }
+            continue;
           }
-        });
+
+          const dist = Math.hypot(enemy.pos.x - player.pos.x, enemy.pos.y - player.pos.y);
+          if (dist < conversionRange) {
+            // Convert to Ally
+            enemy.team = Team.BLUE;
+            enemy.hp = enemy.maxHp;
+            allies.push(enemy);
+            enemies.splice(i, 1);
+            spawnParticles(enemy.pos.x, enemy.pos.y, '#3b82f6', 20);
+            convertedCount++;
+          }
+        }
+
+        if (convertedCount > 0) {
+          spawnDamageText(player.pos.x, player.pos.y - 60, `CONVERTED ${convertedCount}!`, '#3b82f6');
+          soundManager.playCapture();
+        }
       }
     }
 
@@ -343,6 +471,7 @@ export default function App() {
           });
           spawnParticles(enemy.pos.x, enemy.pos.y, '#3b82f6', 25);
           spawnDamageText(enemy.pos.x, enemy.pos.y - 40, "CAPTURED!", '#3b82f6');
+          soundManager.playCapture();
         }
         enemies.splice(i, 1);
       }
@@ -366,9 +495,13 @@ export default function App() {
     if (player.hp <= 0) {
       state.gameOver = true;
       setIsPlaying(false);
+      soundManager.playLoss();
+      soundManager.stopBGM();
     }
     if (state.gameWon) {
       setIsPlaying(false);
+      soundManager.playWin();
+      soundManager.stopBGM();
     }
 
     const elapsed = now - player.lastSkillTime;
@@ -578,14 +711,14 @@ export default function App() {
     }
 
     // Skill Effect
-    if (now - state.player.lastSkillTime < 400) {
-      const progress = (now - state.player.lastSkillTime) / 400;
+    if (now - state.player.lastSkillTime < 500) {
+      const progress = (now - state.player.lastSkillTime) / 500;
       ctx.beginPath();
-      ctx.arc(state.player.pos.x, state.player.pos.y, 200 * progress, 0, Math.PI * 2);
-      ctx.strokeStyle = `rgba(239, 68, 68, ${1 - progress})`;
-      ctx.lineWidth = 15 * (1 - progress);
+      ctx.arc(state.player.pos.x, state.player.pos.y, 300 * progress, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(59, 130, 246, ${1 - progress})`;
+      ctx.lineWidth = 20 * (1 - progress);
       ctx.stroke();
-      ctx.fillStyle = `rgba(239, 68, 68, ${(1 - progress) * 0.2})`;
+      ctx.fillStyle = `rgba(59, 130, 246, ${(1 - progress) * 0.3})`;
       ctx.fill();
     }
 
