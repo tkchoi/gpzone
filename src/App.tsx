@@ -51,7 +51,9 @@ const INITIAL_WALLS: Wall[] = [
 ];
 
 export default function App() {
-  const socketUrl = import.meta.env.VITE_SOCKET_URL?.trim() || undefined;
+  const configuredSocketUrl = import.meta.env.VITE_SOCKET_URL?.trim();
+  const isLocalHost = typeof window !== 'undefined' && ['localhost', '127.0.0.1'].includes(window.location.hostname);
+  const socketUrl = configuredSocketUrl || (isLocalHost ? 'http://127.0.0.1:3000' : undefined);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
