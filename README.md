@@ -1,20 +1,78 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# gpzone
 
-# Run and deploy your AI Studio app
+React/Vite frontend with a Socket.IO realtime server for multiplayer.
 
-This contains everything you need to run your app locally.
+## Local Run
 
-View your app in AI Studio: https://ai.studio/apps/a0496a90-595a-4992-9181-824a5662c821
+Prerequisites:
+- Node.js 20+
 
-## Run Locally
+Install:
 
-**Prerequisites:**  Node.js
+```bash
+npm install
+```
 
+Run the production-style app on one port:
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+```bash
+npm run build
+npm run start
+```
+
+Open:
+
+```text
+http://127.0.0.1:3000
+```
+
+Split frontend/server during development:
+
+```bash
+npm run dev:server
+npm run dev:client
+```
+
+In local development, the frontend auto-connects to `http://127.0.0.1:3000` for realtime features.
+
+## Deployment Model
+
+This project cannot run multiplayer from a static frontend alone.
+
+- Vercel hosts the frontend
+- Render hosts the Socket.IO server
+- Vercel connects to Render through `VITE_SOCKET_URL`
+
+## Render Deployment
+
+This repo includes [`render.yaml`](/Users/gp/gpzone/render.yaml) for a basic Render web service.
+
+Render settings:
+
+- Runtime: `Node`
+- Build Command: `npm install`
+- Start Command: `npm run start`
+- Health Check Path: `/health`
+
+After deploy, Render will give you a URL like:
+
+```text
+https://gpzone-server.onrender.com
+```
+
+## Vercel Deployment
+
+Set this environment variable in Vercel:
+
+```text
+VITE_SOCKET_URL=https://gpzone-server.onrender.com
+```
+
+Then redeploy Vercel.
+
+Without `VITE_SOCKET_URL`, the deployed site will show a realtime connection error and multiplayer will not work.
+
+## Notes
+
+- Render free instances can sleep when idle, so the first multiplayer connection may be slow.
+- Single-player works on the frontend without the realtime server.

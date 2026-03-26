@@ -1,6 +1,7 @@
 import express from "express";
 import { createServer } from "http";
 import { Server } from "socket.io";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -21,11 +22,24 @@ const CANVAS_HEIGHT = 600;
 const MAP_WIDTH = 1600;
 const MAP_HEIGHT = 1600;
 const TICK_RATE = 1000 / 30;
+const DIST_DIR = path.join(__dirname, "dist");
+const DIST_INDEX = path.join(DIST_DIR, "index.html");
 
-if (process.env.NODE_ENV === "production") {
-  app.use(express.static(path.join(__dirname, "dist")));
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
+if (process.env.NODE_ENV === "production" && fs.existsSync(DIST_INDEX)) {
+  app.use(express.static(DIST_DIR));
   app.get("*", (_req, res) => {
-    res.sendFile(path.join(__dirname, "dist", "index.html"));
+    res.sendFile(DIST_INDEX);
+  });
+} else {
+  app.get("/", (_req, res) => {
+    res.json({
+      ok: true,
+      message: "gpzone realtime server",
+    });
   });
 }
 
