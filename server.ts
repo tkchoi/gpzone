@@ -271,6 +271,11 @@ function getEnemyTargetsForOwner(room: RoomState, ownerId: string) {
   ];
 }
 
+function getTeamForOwner(room: RoomState, ownerId?: string): Team {
+  if (!ownerId) return Team.BLUE;
+  return room.players[ownerId]?.team ?? Team.BLUE;
+}
+
 function recordPlayerHistory(room: RoomState, time: number) {
   for (const [socketId, player] of Object.entries(room.players)) {
     if (!room.playerHistory[socketId]) {
@@ -617,7 +622,7 @@ function processPlayerSkill(room: RoomState, socketId: string, player: Entity, i
       continue;
     }
 
-    enemy.team = Team.BLUE;
+    enemy.team = getTeamForOwner(room, socketId);
     enemy.ownerId = socketId;
     enemy.hp = enemy.maxHp;
     room.allies.push({
@@ -659,7 +664,7 @@ function cleanupUnits(room: RoomState) {
           room.allies.push({
             ...enemy,
             id: randomId("ally"),
-            team: Team.BLUE,
+            team: getTeamForOwner(room, ownerId),
             ownerId,
             hp: enemy.maxHp,
             isDead: false,
@@ -696,7 +701,7 @@ function cleanupUnits(room: RoomState) {
           ownerId,
           hp: ally.maxHp,
           isDead: false,
-          team: Team.BLUE,
+          team: getTeamForOwner(room, ownerId),
           pushVelocity: { x: 0, y: 0 },
           lastAttackTime: 0,
         };
@@ -720,14 +725,14 @@ function buildSnapshotForSocket(room: RoomState, socketId: string) {
   const allies = isVersusRoom(room)
     ? room.allies
         .filter((ally) => ally.ownerId === socketId)
-        .map((ally) => ({ ...ally, team: Team.BLUE }))
+        .map((ally) => ({ ...ally, team: getTeamForOwner(room, ally.ownerId) }))
     : room.allies.map((ally) => ({ ...ally, team: Team.BLUE }));
 
   const enemies = isVersusRoom(room)
     ? [
         ...room.allies
           .filter((ally) => ally.ownerId !== socketId)
-          .map((ally) => ({ ...ally, team: Team.RED })),
+          .map((ally) => ({ ...ally, team: getTeamForOwner(room, ally.ownerId) })),
         ...room.enemies.map((enemy) => ({ ...enemy })),
       ]
     : room.enemies.map((enemy) => ({ ...enemy }));
