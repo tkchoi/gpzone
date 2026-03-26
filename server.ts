@@ -16,79 +16,922 @@ const io = new Server(httpServer, {
 });
 
 const PORT = 3000;
+const CANVAS_WIDTH = 800;
+const CANVAS_HEIGHT = 600;
+const MAP_WIDTH = 1600;
+const MAP_HEIGHT = 1600;
+const TICK_RATE = 1000 / 30;
 
-// Serve static files in production
 if (process.env.NODE_ENV === "production") {
   app.use(express.static(path.join(__dirname, "dist")));
-  app.get("*", (req, res) => {
+  app.get("*", (_req, res) => {
     res.sendFile(path.join(__dirname, "dist", "index.html"));
   });
 }
 
-const rooms: { [code: string]: { players: string[]; status: string } } = {};
+enum PieceType {
+  KING = "KING",
+  ROOK = "ROOK",
+  BISHOP = "BISHOP",
+  KNIGHT = "KNIGHT",
+  PAWN = "PAWN",
+}
+
+enum Team {
+  RED = "RED",
+  BLUE = "BLUE",
+  NEUTRAL = "NEUTRAL",
+}
+
+type Position = {
+  x: number;
+  y: number;
+};
+
+type Wall = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type Entity = {
+  id: string;
+  type: PieceType;
+  team: Team;
+  ownerId?: string;
+  lastProcessedInputSeq?: number;
+  pos: Position;
+  hp: number;
+  maxHp: number;
+  speed: number;
+  radius: number;
+  attackRange: number;
+  attackDamage: number;
+  attackCooldown: number;
+  lastAttackTime: number;
+  skillCooldown: number;
+  lastSkillTime: number;
+  isDead: boolean;
+  facingAngle: number;
+  pushVelocity: Position;
+  lastHitTime: number;
+  lastDamagedBy?: string;
+};
+
+type InputState = {
+  seq: number;
+  clientTime: number;
+  moveX: number;
+  moveY: number;
+  attack: boolean;
+  skill: boolean;
+};
+
+type RoomState = {
+  code: string;
+  hostId: string;
+  matchType: "coop" | "versus";
+  players: Record<string, Entity>;
+  inputs: Record<string, InputState>;
+  allies: Entity[];
+  enemies: Entity[];
+  playerHistory: Record<string, Array<{ time: number; pos: Position }>>;
+  walls: Wall[];
+  score: number;
+  gameOver: boolean;
+  gameWon: boolean;
+  screenShake: number;
+  status: "lobby" | "playing";
+  loop: NodeJS.Timeout | null;
+};
+
+const INITIAL_WALLS: Wall[] = [
+  { x: 0, y: 0, width: MAP_WIDTH, height: 60 },
+  { x: 0, y: MAP_HEIGHT - 60, width: MAP_WIDTH, height: 60 },
+  { x: 0, y: 0, width: 60, height: MAP_HEIGHT },
+  { x: MAP_WIDTH - 60, y: 0, width: 60, height: MAP_HEIGHT },
+  { x: 300, y: 300, width: 200, height: 150 },
+  { x: 1100, y: 300, width: 200, height: 150 },
+  { x: 600, y: 600, width: 400, height: 100 },
+  { x: 300, y: 1000, width: 150, height: 300 },
+  { x: 1150, y: 1000, width: 150, height: 300 },
+  { x: 700, y: 900, width: 200, height: 200 },
+];
+
+const rooms: Record<string, RoomState> = {};
+
+function randomId(prefix: string) {
+  return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function createPlayer(socketId: string, index: number, total: number, matchType: "coop" | "versus"): Entity {
+  let spawn = { x: MAP_WIDTH / 2, y: MAP_HEIGHT - 220 };
+  let facingAngle = -Math.PI / 2;
+
+  if (matchType === "versus") {
+    const spawnPoints = [
+      { x: MAP_WIDTH / 2, y: MAP_HEIGHT - 220, facingAngle: -Math.PI / 2 },
+      { x: MAP_WIDTH / 2, y: 220, facingAngle: Math.PI / 2 },
+      { x: 220, y: MAP_HEIGHT / 2, facingAngle: 0 },
+      { x: MAP_WIDTH - 220, y: MAP_HEIGHT / 2, facingAngle: Math.PI },
+    ];
+    const selected = spawnPoints[index] ?? spawnPoints[index % spawnPoints.length];
+    spawn = { x: selected.x, y: selected.y };
+    facingAngle = selected.facingAngle;
+  } else {
+    const spacing = 120;
+    const formationWidth = spacing * Math.max(total - 1, 0);
+    const startX = MAP_WIDTH / 2 - formationWidth / 2;
+    spawn = { x: startX + spacing * index, y: MAP_HEIGHT - 220 };
+  }
+
+  return {
+    id: socketId,
+    type: PieceType.KING,
+    team: Team.BLUE,
+    ownerId: socketId,
+    pos: spawn,
+    hp: 300,
+    maxHp: 300,
+    speed: 5,
+    radius: 24,
+    attackRange: 90,
+    attackDamage: 40,
+    attackCooldown: 400,
+    lastAttackTime: 0,
+    skillCooldown: 4000,
+    lastSkillTime: 0,
+    isDead: false,
+    facingAngle,
+    pushVelocity: { x: 0, y: 0 },
+    lastHitTime: 0,
+    lastProcessedInputSeq: 0,
+  };
+}
+
+function createBoss(): Entity {
+  return {
+    id: "boss",
+    type: PieceType.KING,
+    team: Team.RED,
+    pos: { x: MAP_WIDTH / 2, y: 200 },
+    hp: 1500,
+    maxHp: 1500,
+    speed: 2,
+    radius: 35,
+    attackRange: 120,
+    attackDamage: 50,
+    attackCooldown: 1500,
+    lastAttackTime: 0,
+    skillCooldown: 5000,
+    lastSkillTime: 0,
+    isDead: false,
+    facingAngle: Math.PI / 2,
+    pushVelocity: { x: 0, y: 0 },
+    lastHitTime: 0,
+  };
+}
+
+function createNeutralMinion(): Entity {
+  const x = 100 + Math.random() * (MAP_WIDTH - 200);
+  const y = 100 + Math.random() * (MAP_HEIGHT - 200);
+  return {
+    id: randomId("neutral"),
+    type: PieceType.PAWN,
+    team: Team.NEUTRAL,
+    pos: { x, y },
+    hp: 40,
+    maxHp: 40,
+    speed: 2.5,
+    radius: 18,
+    attackRange: 50,
+    attackDamage: 10,
+    attackCooldown: 1000,
+    lastAttackTime: 0,
+    skillCooldown: 0,
+    lastSkillTime: 0,
+    isDead: false,
+    facingAngle: Math.random() * Math.PI * 2,
+    pushVelocity: { x: 0, y: 0 },
+    lastHitTime: 0,
+  };
+}
+
+function isVersusRoom(room: RoomState) {
+  return room.matchType === "versus";
+}
+
+function getAllLivingPlayers(room: RoomState) {
+  return Object.values(room.players).filter((player) => !player.isDead);
+}
+
+function getEnemyTargetsForOwner(room: RoomState, ownerId: string) {
+  return [
+    ...Object.values(room.players).filter((player) => player.ownerId !== ownerId && !player.isDead),
+    ...room.allies.filter((ally) => ally.ownerId !== ownerId && !ally.isDead),
+    ...room.enemies.filter((enemy) => !enemy.isDead),
+  ];
+}
+
+function recordPlayerHistory(room: RoomState, time: number) {
+  for (const [socketId, player] of Object.entries(room.players)) {
+    if (!room.playerHistory[socketId]) {
+      room.playerHistory[socketId] = [];
+    }
+
+    room.playerHistory[socketId].push({
+      time,
+      pos: { ...player.pos },
+    });
+
+    room.playerHistory[socketId] = room.playerHistory[socketId].filter(entry => time - entry.time <= 1000);
+  }
+}
+
+function getHistoricalPlayerPosition(room: RoomState, socketId: string, targetTime: number) {
+  const history = room.playerHistory[socketId];
+  const current = room.players[socketId];
+  if (!history?.length || !current) return current?.pos ?? { x: 0, y: 0 };
+
+  let closest = history[0];
+  for (const entry of history) {
+    if (Math.abs(entry.time - targetTime) < Math.abs(closest.time - targetTime)) {
+      closest = entry;
+    }
+  }
+
+  return closest.pos;
+}
+
+function resolveWallCollision(entity: Entity, walls: Wall[]) {
+  for (const wall of walls) {
+    let testX = entity.pos.x;
+    let testY = entity.pos.y;
+
+    if (entity.pos.x < wall.x) testX = wall.x;
+    else if (entity.pos.x > wall.x + wall.width) testX = wall.x + wall.width;
+
+    if (entity.pos.y < wall.y) testY = wall.y;
+    else if (entity.pos.y > wall.y + wall.height) testY = wall.y + wall.height;
+
+    const distX = entity.pos.x - testX;
+    const distY = entity.pos.y - testY;
+    const distance = Math.sqrt(distX * distX + distY * distY);
+
+    if (distance < entity.radius) {
+      if (distance === 0) {
+        entity.pos.y -= entity.radius;
+      } else {
+        const pushDist = entity.radius - distance;
+        entity.pos.x += (distX / distance) * pushDist;
+        entity.pos.y += (distY / distance) * pushDist;
+      }
+    }
+  }
+}
+
+function applyMapBounds(entity: Entity) {
+  const margin = 60 + entity.radius;
+  entity.pos.x = clamp(entity.pos.x, margin, MAP_WIDTH - margin);
+  entity.pos.y = clamp(entity.pos.y, margin, MAP_HEIGHT - margin);
+}
+
+function liveBlueUnits(room: RoomState) {
+  if (isVersusRoom(room)) {
+    return [
+      ...getAllLivingPlayers(room),
+      ...room.allies.filter((ally) => !ally.isDead),
+    ];
+  }
+  return [
+    ...Object.values(room.players).filter((player) => !player.isDead),
+    ...room.allies.filter((ally) => !ally.isDead),
+  ];
+}
+
+function nearestTarget(entity: Entity, targets: Entity[]) {
+  let closest: Entity | null = null;
+  let minDist = Infinity;
+
+  for (const target of targets) {
+    if (target.isDead) continue;
+    const dist = Math.hypot(target.pos.x - entity.pos.x, target.pos.y - entity.pos.y);
+    if (dist < minDist) {
+      minDist = dist;
+      closest = target;
+    }
+  }
+
+  return { closest, minDist };
+}
+
+function performMeleeAttack(attacker: Entity, target: Entity, now: number) {
+  target.hp -= attacker.attackDamage;
+  target.lastHitTime = now;
+  target.lastDamagedBy = attacker.ownerId;
+  const angle = Math.atan2(target.pos.y - attacker.pos.y, target.pos.x - attacker.pos.x);
+  target.pushVelocity.x = Math.cos(angle) * 8;
+  target.pushVelocity.y = Math.sin(angle) * 8;
+  attacker.lastAttackTime = now;
+}
+
+function updateEnemyAI(room: RoomState, entity: Entity, now: number) {
+  const targets = liveBlueUnits(room);
+  const { closest, minDist } = nearestTarget(entity, targets);
+
+  if (!closest) return;
+
+  const angle = Math.atan2(closest.pos.y - entity.pos.y, closest.pos.x - entity.pos.x);
+  entity.facingAngle = angle;
+
+  if (entity.id === "boss") {
+    const isBerserk = entity.hp < entity.maxHp * 0.4;
+    const speed = isBerserk ? entity.speed * 1.5 : entity.speed;
+    const coopLivingPlayers = isVersusRoom(room)
+      ? 1
+      : Math.max(1, Object.values(room.players).filter((player) => !player.isDead && player.hp > 0).length);
+    const coopPressureMultiplier = isVersusRoom(room)
+      ? 1
+      : Math.pow(2.5, Math.max(0, coopLivingPlayers - 1));
+    const cooldownBase = isBerserk ? entity.attackCooldown * 0.7 : entity.attackCooldown;
+    const cooldown = Math.max(250, cooldownBase / coopPressureMultiplier);
+
+    const skillCooldownBase = entity.skillCooldown;
+    const skillCooldown = Math.max(900, skillCooldownBase / coopPressureMultiplier);
+
+    if (now - entity.lastSkillTime > skillCooldown) {
+      if (minDist > 150 && minDist < 600) {
+        entity.lastSkillTime = now;
+        entity.pushVelocity.x = Math.cos(angle) * (isBerserk ? 35 : 25);
+        entity.pushVelocity.y = Math.sin(angle) * (isBerserk ? 35 : 25);
+        room.screenShake = 20;
+      } else if (room.allies.length > 0) {
+        const corruptionRange = 320;
+        let converted = false;
+        for (let i = room.allies.length - 1; i >= 0; i -= 1) {
+          const ally = room.allies[i];
+          if (Math.hypot(ally.pos.x - entity.pos.x, ally.pos.y - entity.pos.y) < corruptionRange) {
+            room.allies.splice(i, 1);
+            room.enemies.push({
+              ...ally,
+              id: randomId("corrupt"),
+              team: Team.RED,
+              hp: ally.maxHp,
+            });
+            converted = true;
+          }
+        }
+        if (converted) {
+          entity.lastSkillTime = now;
+          room.screenShake = 15;
+        }
+      }
+    }
+
+    if (minDist > entity.attackRange - 20) {
+      let vx = Math.cos(angle) * speed;
+      let vy = Math.sin(angle) * speed;
+      for (const wall of room.walls) {
+        const closestX = Math.max(wall.x, Math.min(entity.pos.x, wall.x + wall.width));
+        const closestY = Math.max(wall.y, Math.min(entity.pos.y, wall.y + wall.height));
+        const dx = entity.pos.x - closestX;
+        const dy = entity.pos.y - closestY;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < 100 && dist > 0) {
+          const force = (100 - dist) / 100;
+          vx += (dx / dist) * force * 3;
+          vy += (dy / dist) * force * 3;
+        }
+      }
+      entity.pos.x += vx;
+      entity.pos.y += vy;
+    } else if (now - entity.lastAttackTime > cooldown) {
+      performMeleeAttack(entity, closest, now);
+    }
+
+    return;
+  }
+
+  if (minDist > entity.attackRange - 10) {
+    entity.pos.x += Math.cos(angle) * entity.speed;
+    entity.pos.y += Math.sin(angle) * entity.speed;
+  } else if (now - entity.lastAttackTime > entity.attackCooldown) {
+    performMeleeAttack(entity, closest, now);
+  }
+}
+
+function updateAllies(room: RoomState, now: number) {
+  for (let i = room.allies.length - 1; i >= 0; i -= 1) {
+    const ally = room.allies[i];
+    ally.pos.x += ally.pushVelocity.x;
+    ally.pos.y += ally.pushVelocity.y;
+    ally.pushVelocity.x *= 0.8;
+    ally.pushVelocity.y *= 0.8;
+
+    const targets = isVersusRoom(room)
+      ? getEnemyTargetsForOwner(room, ally.ownerId ?? "")
+      : room.enemies.filter((enemy) => !enemy.isDead);
+    const { closest, minDist } = nearestTarget(ally, targets);
+    if (closest) {
+      const angle = Math.atan2(closest.pos.y - ally.pos.y, closest.pos.x - ally.pos.x);
+      ally.facingAngle = angle;
+      if (minDist > ally.attackRange - 10) {
+        ally.pos.x += Math.cos(angle) * ally.speed;
+        ally.pos.y += Math.sin(angle) * ally.speed;
+      } else if (now - ally.lastAttackTime > ally.attackCooldown) {
+        performMeleeAttack(ally, closest, now);
+      }
+    }
+
+    resolveWallCollision(ally, room.walls);
+    applyMapBounds(ally);
+
+    if (ally.hp <= 0 && !isVersusRoom(room)) {
+      room.allies.splice(i, 1);
+    }
+  }
+}
+
+function updatePlayers(room: RoomState, now: number) {
+  for (const [socketId, player] of Object.entries(room.players)) {
+    if (player.hp <= 0) {
+      player.hp = 0;
+      player.isDead = true;
+      continue;
+    }
+
+    const input = room.inputs[socketId] || { seq: 0, clientTime: now, moveX: 0, moveY: 0, attack: false, skill: false };
+    player.lastProcessedInputSeq = input.seq;
+    const magnitude = Math.hypot(input.moveX, input.moveY);
+    const moveX = magnitude > 0 ? input.moveX / magnitude : 0;
+    const moveY = magnitude > 0 ? input.moveY / magnitude : 0;
+
+    if (magnitude > 0) {
+      player.pos.x += moveX * player.speed;
+      player.pos.y += moveY * player.speed;
+      player.facingAngle = Math.atan2(moveY, moveX);
+    }
+
+    player.pos.x += player.pushVelocity.x;
+    player.pos.y += player.pushVelocity.y;
+    player.pushVelocity.x *= 0.8;
+    player.pushVelocity.y *= 0.8;
+
+    resolveWallCollision(player, room.walls);
+    applyMapBounds(player);
+
+    if (input.attack && now - player.lastAttackTime > player.attackCooldown) {
+      const attackSpread = Math.PI / 1.5;
+      const targets = isVersusRoom(room)
+        ? getEnemyTargetsForOwner(room, socketId)
+        : room.enemies;
+      const lagCompMs = clamp(now - input.clientTime, 0, 150);
+      const attackOrigin = isVersusRoom(room)
+        ? getHistoricalPlayerPosition(room, socketId, now - lagCompMs)
+        : player.pos;
+      for (const enemy of targets) {
+        const targetPos = isVersusRoom(room) && enemy.ownerId
+          ? getHistoricalPlayerPosition(room, enemy.ownerId, now - lagCompMs)
+          : enemy.pos;
+        const dx = targetPos.x - attackOrigin.x;
+        const dy = targetPos.y - attackOrigin.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist > player.attackRange + enemy.radius) continue;
+
+        let angleDiff = Math.abs(Math.atan2(dy, dx) - player.facingAngle);
+        while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+        angleDiff = Math.abs(angleDiff);
+
+        if (angleDiff <= attackSpread / 2) {
+          enemy.hp -= player.attackDamage;
+          enemy.lastHitTime = now;
+          enemy.lastDamagedBy = socketId;
+          enemy.pushVelocity.x = Math.cos(Math.atan2(dy, dx)) * 10;
+          enemy.pushVelocity.y = Math.sin(Math.atan2(dy, dx)) * 10;
+        }
+      }
+      player.lastAttackTime = now;
+    }
+
+    if (input.skill && now - player.lastSkillTime > player.skillCooldown) {
+      player.lastSkillTime = now;
+      room.screenShake = 25;
+      player.pushVelocity.x = Math.cos(player.facingAngle) * 45;
+      player.pushVelocity.y = Math.sin(player.facingAngle) * 45;
+      const lagCompMs = clamp(now - input.clientTime, 0, 150);
+      const skillOrigin = isVersusRoom(room)
+        ? getHistoricalPlayerPosition(room, socketId, now - lagCompMs)
+        : player.pos;
+
+      if (isVersusRoom(room)) {
+        const hostilePlayers = Object.values(room.players).filter(
+          (targetPlayer) => targetPlayer.ownerId !== socketId && !targetPlayer.isDead,
+        );
+        for (const targetPlayer of hostilePlayers) {
+          const targetPos = getHistoricalPlayerPosition(room, targetPlayer.ownerId ?? targetPlayer.id, now - lagCompMs);
+          const dist = Math.hypot(targetPos.x - skillOrigin.x, targetPos.y - skillOrigin.y);
+          if (dist < 300) {
+            targetPlayer.hp -= 180;
+            targetPlayer.lastHitTime = now;
+            targetPlayer.lastDamagedBy = socketId;
+          }
+        }
+
+        for (let i = room.allies.length - 1; i >= 0; i -= 1) {
+          const enemyUnit = room.allies[i];
+          const dist = Math.hypot(enemyUnit.pos.x - skillOrigin.x, enemyUnit.pos.y - skillOrigin.y);
+          if (dist >= 300 || enemyUnit.ownerId === socketId) continue;
+          enemyUnit.ownerId = socketId;
+          enemyUnit.lastDamagedBy = socketId;
+        }
+      }
+
+      for (let i = room.enemies.length - 1; i >= 0; i -= 1) {
+        const enemy = room.enemies[i];
+        const dist = Math.hypot(enemy.pos.x - skillOrigin.x, enemy.pos.y - skillOrigin.y);
+        if (dist >= 300) continue;
+
+        if (enemy.id === "boss") {
+          enemy.hp -= 300;
+          enemy.lastHitTime = now;
+          enemy.lastDamagedBy = socketId;
+          continue;
+        }
+
+        enemy.team = Team.BLUE;
+        enemy.ownerId = socketId;
+        enemy.hp = enemy.maxHp;
+        room.allies.push({
+          ...enemy,
+          id: randomId("ally"),
+          pushVelocity: { x: 0, y: 0 },
+          lastAttackTime: 0,
+        });
+        room.enemies.splice(i, 1);
+      }
+    }
+  }
+}
+
+function cleanupUnits(room: RoomState) {
+  for (const player of Object.values(room.players)) {
+    if (player.hp <= 0) {
+      player.hp = 0;
+      player.isDead = true;
+    }
+  }
+
+  for (let i = room.enemies.length - 1; i >= 0; i -= 1) {
+    const enemy = room.enemies[i];
+    if (enemy.hp > 0) continue;
+
+    if (enemy.id === "boss") {
+      room.gameWon = true;
+      room.score += 5000;
+    } else {
+      room.score += 100;
+      if (isVersusRoom(room)) {
+        const ownerId = enemy.lastDamagedBy;
+        if (ownerId && room.players[ownerId]) {
+          room.allies.push({
+            ...enemy,
+            id: randomId("ally"),
+            team: Team.BLUE,
+            ownerId,
+            hp: enemy.maxHp,
+            isDead: false,
+            pushVelocity: { x: 0, y: 0 },
+            lastAttackTime: 0,
+          });
+        }
+      } else {
+        room.allies.push({
+          ...enemy,
+          id: randomId("ally"),
+          team: Team.BLUE,
+          hp: enemy.maxHp,
+          isDead: false,
+          pushVelocity: { x: 0, y: 0 },
+          lastAttackTime: 0,
+        });
+      }
+    }
+
+    room.enemies.splice(i, 1);
+  }
+
+  for (let i = room.allies.length - 1; i >= 0; i -= 1) {
+    const ally = room.allies[i];
+    if (ally.hp > 0) continue;
+
+    if (isVersusRoom(room)) {
+      const ownerId = ally.lastDamagedBy;
+      if (ownerId && room.players[ownerId] && ownerId !== ally.ownerId) {
+        room.allies[i] = {
+          ...ally,
+          id: randomId("ally"),
+          ownerId,
+          hp: ally.maxHp,
+          isDead: false,
+          team: Team.BLUE,
+          pushVelocity: { x: 0, y: 0 },
+          lastAttackTime: 0,
+        };
+        continue;
+      }
+    }
+
+    room.allies.splice(i, 1);
+  }
+}
+
+function buildSnapshotForSocket(room: RoomState, socketId: string) {
+  const localPlayer = room.players[socketId];
+  const players = Object.fromEntries(
+    Object.entries(room.players).map(([id, player]) => {
+      if (!isVersusRoom(room) || id === socketId) {
+        return [id, { ...player, team: Team.BLUE }];
+      }
+
+      return [
+        id,
+        {
+          ...player,
+          type: PieceType.KING,
+          team: Team.RED,
+          radius: 35,
+        },
+      ];
+    }),
+  );
+
+  const allies = isVersusRoom(room)
+    ? room.allies
+        .filter((ally) => ally.ownerId === socketId)
+        .map((ally) => ({ ...ally, team: Team.BLUE }))
+    : room.allies.map((ally) => ({ ...ally, team: Team.BLUE }));
+
+  const enemies = isVersusRoom(room)
+    ? [
+        ...room.allies
+          .filter((ally) => ally.ownerId !== socketId)
+          .map((ally) => ({ ...ally, team: Team.RED })),
+        ...room.enemies.map((enemy) => ({ ...enemy })),
+      ]
+    : room.enemies.map((enemy) => ({ ...enemy }));
+
+  const aliveOpponents = Object.values(room.players).filter(
+    (player) => player.ownerId !== socketId && player.hp > 0 && !player.isDead,
+  ).length;
+  const gameOver = isVersusRoom(room)
+    ? Boolean(localPlayer && (localPlayer.hp <= 0 || localPlayer.isDead))
+    : room.gameOver;
+  const gameWon = isVersusRoom(room)
+    ? Boolean(localPlayer && !gameOver && aliveOpponents === 0)
+    : room.gameWon;
+
+  return {
+    players,
+    allies,
+    enemies,
+    walls: room.walls,
+    score: room.score,
+    gameOver,
+    gameWon,
+    screenShake: room.screenShake,
+    status: room.status,
+    matchType: room.matchType,
+  };
+}
+
+function emitGameState(room: RoomState) {
+  Object.keys(room.players).forEach((socketId) => {
+    io.to(socketId).emit("game-state", buildSnapshotForSocket(room, socketId));
+  });
+}
+
+function emitRoomUpdate(room: RoomState) {
+  io.to(room.code).emit("room-update", {
+    players: Object.keys(room.players),
+    hostId: room.hostId,
+    status: room.status,
+    matchType: room.matchType,
+  });
+}
+
+function stopRoomLoop(room: RoomState) {
+  if (room.loop) {
+    clearInterval(room.loop);
+    room.loop = null;
+  }
+}
+
+function destroyRoom(code: string) {
+  const room = rooms[code];
+  if (!room) return;
+  stopRoomLoop(room);
+  delete rooms[code];
+}
+
+function tickRoom(room: RoomState) {
+  if (room.status !== "playing" || room.gameOver || room.gameWon) {
+    if (room.status === "playing") {
+      emitGameState(room);
+    }
+    return;
+  }
+
+  const now = Date.now();
+  room.screenShake *= 0.9;
+  if (room.screenShake < 0.5) room.screenShake = 0;
+
+  recordPlayerHistory(room, now);
+
+  updatePlayers(room, now);
+  updateAllies(room, now);
+
+  for (const enemy of room.enemies) {
+    enemy.pos.x += enemy.pushVelocity.x;
+    enemy.pos.y += enemy.pushVelocity.y;
+    enemy.pushVelocity.x *= 0.8;
+    enemy.pushVelocity.y *= 0.8;
+    updateEnemyAI(room, enemy, now);
+    resolveWallCollision(enemy, room.walls);
+    applyMapBounds(enemy);
+  }
+
+  cleanupUnits(room);
+
+  if (isVersusRoom(room)) {
+    const alivePlayers = Object.values(room.players).filter((player) => player.hp > 0 && !player.isDead).length;
+    if (alivePlayers <= 1) {
+      room.gameWon = true;
+    }
+  } else if (Object.values(room.players).every((player) => player.hp <= 0 || player.isDead)) {
+    room.gameOver = true;
+  }
+
+  recordPlayerHistory(room, now + 1);
+  emitGameState(room);
+}
+
+function initializeRoomGame(room: RoomState) {
+  stopRoomLoop(room);
+  room.status = "playing";
+  room.score = 0;
+  room.gameOver = false;
+  room.gameWon = false;
+  room.screenShake = 0;
+  room.walls = INITIAL_WALLS.map((wall) => ({ ...wall }));
+  room.allies = [];
+  room.enemies = room.matchType === "coop" ? [createBoss()] : [];
+  room.playerHistory = {};
+
+  const playerIds = Object.keys(room.players);
+  room.players = Object.fromEntries(
+    playerIds.map((id, index) => [id, createPlayer(id, index, playerIds.length, room.matchType)]),
+  );
+  recordPlayerHistory(room, Date.now());
+
+  for (let i = 0; i < 20; i += 1) {
+    room.enemies.push(createNeutralMinion());
+  }
+
+  room.loop = setInterval(() => tickRoom(room), TICK_RATE);
+  io.to(room.code).emit("game-started");
+  emitRoomUpdate(room);
+  emitGameState(room);
+}
+
+function createRoom(code: string, socketId: string, matchType: "coop" | "versus"): RoomState {
+  return {
+    code,
+    hostId: socketId,
+    matchType,
+    players: { [socketId]: createPlayer(socketId, 0, 1, matchType) },
+    inputs: { [socketId]: { seq: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false } },
+    allies: [],
+    enemies: [],
+    playerHistory: {},
+    walls: INITIAL_WALLS.map((wall) => ({ ...wall })),
+    score: 0,
+    gameOver: false,
+    gameWon: false,
+    screenShake: 0,
+    status: "lobby",
+    loop: null,
+  };
+}
+
+function detachSocketFromRooms(socketId: string) {
+  for (const [code, room] of Object.entries(rooms)) {
+    if (!room.players[socketId]) continue;
+
+    delete room.players[socketId];
+    delete room.inputs[socketId];
+
+    if (room.hostId === socketId) {
+      const nextHost = Object.keys(room.players)[0];
+      if (nextHost) {
+        room.hostId = nextHost;
+      }
+    }
+
+    if (Object.keys(room.players).length === 0) {
+      destroyRoom(code);
+      continue;
+    }
+
+    emitRoomUpdate(room);
+    if (room.status === "playing") {
+      emitGameState(room);
+    }
+  }
+}
 
 io.on("connection", (socket) => {
-  socket.on("create-room", () => {
+  socket.on("create-room", (payload?: { matchType?: "coop" | "versus" }) => {
+    for (const room of socket.rooms) {
+      if (rooms[room]) socket.leave(room);
+    }
+    detachSocketFromRooms(socket.id);
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-    rooms[code] = { players: [socket.id], status: "lobby" };
+    const room = createRoom(code, socket.id, payload?.matchType === "versus" ? "versus" : "coop");
+    rooms[code] = room;
     socket.join(code);
     socket.emit("room-created", code);
-    io.to(code).emit("room-update", { players: rooms[code].players });
+    emitRoomUpdate(room);
   });
 
-  socket.on("join-room", (code) => {
+  socket.on("join-room", (code: string) => {
+    for (const roomName of socket.rooms) {
+      if (rooms[roomName]) socket.leave(roomName);
+    }
+    detachSocketFromRooms(socket.id);
     const upperCode = code.toUpperCase();
-    if (rooms[upperCode]) {
-      if (rooms[upperCode].status !== "lobby") {
-        socket.emit("error-message", "Game already in progress");
-        return;
-      }
-      rooms[upperCode].players.push(socket.id);
-      socket.join(upperCode);
-      socket.emit("room-joined", upperCode);
-      io.to(upperCode).emit("room-update", { players: rooms[upperCode].players });
-    } else {
+    const room = rooms[upperCode];
+
+    if (!room) {
       socket.emit("error-message", "Room not found");
+      return;
     }
-  });
 
-  socket.on("start-game", (code) => {
-    if (rooms[code] && rooms[code].players[0] === socket.id) {
-      rooms[code].status = "playing";
-      io.to(code).emit("game-started");
+    if (room.status !== "lobby") {
+      socket.emit("error-message", "Game already in progress");
+      return;
     }
-  });
 
-  socket.on("sync-state", (data) => {
-    const { roomCode, state } = data;
-    socket.to(roomCode).emit("remote-sync", { id: socket.id, state });
+    room.players[socket.id] = createPlayer(
+      socket.id,
+      Object.keys(room.players).length,
+      Object.keys(room.players).length + 1,
+      room.matchType,
+    );
+    room.inputs[socket.id] = { seq: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
+    socket.join(upperCode);
+    socket.emit("room-joined", upperCode);
+    emitRoomUpdate(room);
   });
 
   socket.on("leave-room", () => {
+    detachSocketFromRooms(socket.id);
     for (const room of socket.rooms) {
       if (rooms[room]) {
-        rooms[room].players = rooms[room].players.filter(id => id !== socket.id);
         socket.leave(room);
-        if (rooms[room].players.length === 0) {
-          delete rooms[room];
-        } else {
-          io.to(room).emit("room-update", { players: rooms[room].players });
-        }
       }
     }
   });
 
+  socket.on("start-game", (code: string) => {
+    const room = rooms[code];
+    if (!room) return;
+    if (room.hostId !== socket.id) return;
+    if (Object.keys(room.players).length < 2) return;
+    initializeRoomGame(room);
+  });
+
+  socket.on("player-input", (data: { roomCode: string; input: InputState }) => {
+    const room = rooms[data.roomCode];
+    if (!room || room.status !== "playing" || !room.inputs[socket.id]) return;
+    const currentSeq = room.inputs[socket.id].seq;
+    if (typeof data.input.seq !== "number" || data.input.seq < currentSeq) return;
+    room.inputs[socket.id] = {
+      seq: data.input.seq,
+      clientTime: typeof data.input.clientTime === "number" ? data.input.clientTime : Date.now(),
+      moveX: clamp(data.input.moveX, -1, 1),
+      moveY: clamp(data.input.moveY, -1, 1),
+      attack: Boolean(data.input.attack),
+      skill: Boolean(data.input.skill),
+    };
+  });
+
   socket.on("disconnecting", () => {
-    for (const room of socket.rooms) {
-      if (rooms[room]) {
-        rooms[room].players = rooms[room].players.filter(id => id !== socket.id);
-        if (rooms[room].players.length === 0) {
-          delete rooms[room];
-        } else {
-          io.to(room).emit("room-update", { players: rooms[room].players });
-        }
-      }
-    }
+    detachSocketFromRooms(socket.id);
   });
 });
 

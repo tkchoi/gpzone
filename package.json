@@ -5,11 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
+    "dev:client": "vite --host 0.0.0.0",
+    "dev:server": "tsx server.ts",
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "start": "node server.ts"
+    "start": "NODE_ENV=production tsx server.ts",
+    "start:prod": "npm run build && NODE_ENV=production tsx server.ts"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",

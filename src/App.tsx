@@ -11,6 +11,28 @@ const CANVAS_HEIGHT = 600;
 const MAP_WIDTH = 1600;
 const MAP_HEIGHT = 1600;
 
+type MultiplayerInputState = {
+  seq: number;
+  clientTime: number;
+  moveX: number;
+  moveY: number;
+  attack: boolean;
+  skill: boolean;
+};
+
+type MultiplayerSnapshot = {
+  players: Record<string, Entity>;
+  allies: Entity[];
+  enemies: Entity[];
+  walls: Wall[];
+  score: number;
+  gameOver: boolean;
+  gameWon: boolean;
+  screenShake: number;
+  status: 'lobby' | 'playing';
+  matchType: 'coop' | 'versus';
+};
+
 // Hashima Island (Gunkanjima) style ruined concrete map
 const INITIAL_WALLS: Wall[] = [
   // Outer boundaries
@@ -50,11 +72,19 @@ export default function App() {
     isHost: boolean;
     players: string[];
     status: 'lobby' | 'playing';
+    matchType: 'coop' | 'versus';
     error: string;
-  }>({ roomCode: '', isHost: false, players: [], status: 'lobby', error: '' });
+  }>({ roomCode: '', isHost: false, players: [], status: 'lobby', matchType: 'versus', error: '' });
   const [joinCode, setJoinCode] = useState('');
   const [copied, setCopied] = useState(false);
   const socketRef = useRef<Socket | null>(null);
+  const multiInputRef = useRef<MultiplayerInputState>({ seq: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false });
+  const multiOutcomeRef = useRef({ gameOver: false, gameWon: false });
+  const gameModeRef = useRef<'single' | 'multi' | null>(null);
+  const roomCodeRef = useRef('');
+  const pendingAutoJoinRef = useRef('');
+  const inputSeqRef = useRef(0);
+  const previousRemotePlayersRef = useRef<Record<string, Entity>>({});
 
   const isPlayingRef = useRef(false);
   const isPausedRef = useRef(false);
@@ -65,19 +95,248 @@ export default function App() {
   const accumulatorRef = useRef<number>(0);
   const TIME_STEP = 1000 / 60; // 60 FPS fixed timestep
 
+  const createEmptyPlayer = (): Entity => ({
+    id: 'player',
+    type: PieceType.KING,
+    team: Team.BLUE,
+    lastProcessedInputSeq: 0,
+    pos: { x: MAP_WIDTH / 2, y: MAP_HEIGHT - 200 },
+    hp: 300,
+    maxHp: 300,
+    speed: 5,
+    radius: 24,
+    attackRange: 90,
+    attackDamage: 40,
+    attackCooldown: 400,
+    lastAttackTime: 0,
+    skillCooldown: 4000,
+    lastSkillTime: 0,
+    isDead: false,
+    facingAngle: -Math.PI / 2,
+    pushVelocity: { x: 0, y: 0 },
+    lastHitTime: 0,
+  });
+
+  const applyPredictedMovement = (player: Entity, input: MultiplayerInputState) => {
+    player.pos.x += player.pushVelocity.x;
+    player.pos.y += player.pushVelocity.y;
+    player.pushVelocity.x *= 0.82;
+    player.pushVelocity.y *= 0.82;
+
+    const magnitude = Math.hypot(input.moveX, input.moveY);
+    if (magnitude > 0) {
+      const moveX = input.moveX / magnitude;
+      const moveY = input.moveY / magnitude;
+      player.pos.x += moveX * player.speed;
+      player.pos.y += moveY * player.speed;
+      player.facingAngle = Math.atan2(moveY, moveX);
+    }
+
+    const margin = 60 + player.radius;
+    player.pos.x = Math.max(margin, Math.min(MAP_WIDTH - margin, player.pos.x));
+    player.pos.y = Math.max(margin, Math.min(MAP_HEIGHT - margin, player.pos.y));
+  };
+
+  const blendEntityPosition = (prev: Entity | undefined, next: Entity, factor: number) => {
+    if (!prev) return next;
+    const dx = next.pos.x - prev.pos.x;
+    const dy = next.pos.y - prev.pos.y;
+    const dist = Math.hypot(dx, dy);
+
+    if (dist < 3) {
+      return {
+        ...next,
+        pos: { ...prev.pos },
+        facingAngle: prev.facingAngle,
+      };
+    }
+
+    if (dist > 90) {
+      return next;
+    }
+
+    return {
+      ...next,
+      pos: {
+        x: prev.pos.x + dx * factor,
+        y: prev.pos.y + dy * factor,
+      },
+      facingAngle: prev.facingAngle + (next.facingAngle - prev.facingAngle) * factor,
+    };
+  };
+
+  const predictMultiplayerStep = () => {
+    const state = gameStateRef.current;
+    if (!state) return;
+
+    const player = state.player;
+    const currentInput = multiInputRef.current;
+    applyPredictedMovement(player, currentInput);
+  };
+
+  const syncMultiInput = (patch: Partial<MultiplayerInputState> = {}) => {
+    const nextInput = {
+      ...multiInputRef.current,
+      ...patch,
+      seq: inputSeqRef.current + 1,
+      clientTime: Date.now()
+    };
+    inputSeqRef.current = nextInput.seq;
+    multiInputRef.current = nextInput;
+
+    if (gameModeRef.current === 'multi' && roomCodeRef.current) {
+      socketRef.current?.emit('player-input', {
+        roomCode: roomCodeRef.current,
+        input: nextInput
+      });
+    }
+  };
+
+  const resetToMenu = (leaveMultiRoom = false) => {
+    if (leaveMultiRoom && multiState.roomCode) {
+      socketRef.current?.emit('leave-room');
+    }
+    keysPressed.current.clear();
+    joystickRef.current = { x: 0, y: 0 };
+    setJoystick({ active: false, x: 0, y: 0, startX: 0, startY: 0 });
+    if (requestRef.current) cancelAnimationFrame(requestRef.current);
+    isPlayingRef.current = false;
+    setIsPlaying(false);
+    setIsPaused(false);
+    isPausedRef.current = false;
+    soundManager.stopBGM();
+    gameModeRef.current = null;
+    roomCodeRef.current = '';
+    pendingAutoJoinRef.current = '';
+    window.history.replaceState({}, '', window.location.pathname);
+    setGameMode(null);
+    setJoinCode('');
+    inputSeqRef.current = 0;
+    previousRemotePlayersRef.current = {};
+    multiInputRef.current = { seq: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
+    multiOutcomeRef.current = { gameOver: false, gameWon: false };
+    setMultiState({ roomCode: '', isHost: false, players: [], status: 'lobby', matchType: 'versus', error: '' });
+    gameStateRef.current = null;
+    setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
+  };
+
+  const applyMultiplayerSnapshot = (snapshot: MultiplayerSnapshot) => {
+    const socketId = socketRef.current?.id;
+    if (!socketId) return;
+    setMultiState(prev => ({ ...prev, matchType: snapshot.matchType }));
+
+    const serverPlayer = snapshot.players[socketId] ?? createEmptyPlayer();
+    const previousPlayer = gameStateRef.current?.player;
+    const localPlayer = { ...serverPlayer, id: 'player' };
+
+    if (previousPlayer && !snapshot.gameOver && !snapshot.gameWon) {
+      const dx = localPlayer.pos.x - previousPlayer.pos.x;
+      const dy = localPlayer.pos.y - previousPlayer.pos.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < 6) {
+        localPlayer.pos = { ...previousPlayer.pos };
+      } else if (dist < 80) {
+        localPlayer.pos = {
+          x: previousPlayer.pos.x + dx * 0.2,
+          y: previousPlayer.pos.y + dy * 0.2,
+        };
+      }
+    }
+
+    const remotePlayers = Object.fromEntries(
+      Object.entries(snapshot.players)
+        .filter(([id]) => id !== socketId)
+        .map(([id, player]) => {
+          const prev = previousRemotePlayersRef.current[id];
+          const blended = blendEntityPosition(prev, { ...player, id: `remote-${id}` }, 0.45);
+          return [id, blended];
+        })
+    );
+    previousRemotePlayersRef.current = remotePlayers;
+
+    gameStateRef.current = {
+      player: localPlayer,
+      remotePlayers,
+      allies: snapshot.allies,
+      enemies: snapshot.enemies,
+      particles: [],
+      damageTexts: [],
+      walls: snapshot.walls,
+      score: snapshot.score,
+      gameOver: snapshot.gameOver,
+      gameWon: snapshot.gameWon,
+      screenShake: snapshot.screenShake,
+    };
+
+    const elapsed = Math.max(0, Date.now() - localPlayer.lastSkillTime);
+    const skillPercent = Math.min(100, (elapsed / localPlayer.skillCooldown) * 100);
+
+    if (!multiOutcomeRef.current.gameWon && snapshot.gameWon) {
+      soundManager.playWin();
+      soundManager.stopBGM();
+    }
+    if (!multiOutcomeRef.current.gameOver && snapshot.gameOver) {
+      soundManager.playLoss();
+      soundManager.stopBGM();
+    }
+    multiOutcomeRef.current = { gameOver: snapshot.gameOver, gameWon: snapshot.gameWon };
+
+    if (!snapshot.gameOver && !snapshot.gameWon) {
+      isPlayingRef.current = true;
+      setIsPlaying(true);
+    } else {
+      isPlayingRef.current = false;
+      setIsPlaying(false);
+    }
+
+    setUiState({
+      score: snapshot.score,
+      skillPercent,
+      gameOver: snapshot.gameOver,
+      gameWon: snapshot.gameWon,
+      allyCount: snapshot.allies.length
+    });
+  };
+
   const initGame = (mode: 'single' | 'multi' = 'single') => {
     keysPressed.current.clear();
     joystickRef.current = { x: 0, y: 0 };
     setJoystick({ active: false, x: 0, y: 0, startX: 0, startY: 0 });
 
-    const player: Entity = {
-      id: 'player', type: PieceType.KING, team: Team.BLUE,
-      pos: { x: MAP_WIDTH / 2, y: MAP_HEIGHT - 200 },
-      hp: 300, maxHp: 300, speed: 5, radius: 24,
-      attackRange: 90, attackDamage: 40, attackCooldown: 400, lastAttackTime: 0,
-      skillCooldown: 4000, lastSkillTime: 0, isDead: false,
-      facingAngle: -Math.PI / 2, pushVelocity: { x: 0, y: 0 }, lastHitTime: 0,
-    };
+    if (mode === 'multi') {
+      inputSeqRef.current = 0;
+      previousRemotePlayersRef.current = {};
+      multiInputRef.current = { seq: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
+      multiOutcomeRef.current = { gameOver: false, gameWon: false };
+      gameStateRef.current = {
+        player: createEmptyPlayer(),
+        remotePlayers: {},
+        allies: [],
+        enemies: [],
+        particles: [],
+        damageTexts: [],
+        walls: INITIAL_WALLS,
+        score: 0,
+        gameOver: false,
+        gameWon: false,
+        screenShake: 0,
+      };
+      setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
+      totalPausedTimeRef.current = 0;
+      pauseStartTimeRef.current = 0;
+      lastTimeRef.current = performance.now();
+      accumulatorRef.current = 0;
+      isPausedRef.current = false;
+      setIsPaused(false);
+      isPlayingRef.current = true;
+      setIsPlaying(true);
+      soundManager.startBGM();
+      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      requestRef.current = requestAnimationFrame(update);
+      return;
+    }
+
+    const player: Entity = createEmptyPlayer();
 
     const boss: Entity = {
       id: 'boss', type: PieceType.KING, team: Team.RED,
@@ -94,14 +353,9 @@ export default function App() {
     };
     
     // Initial guards
-    if (mode === 'single') {
-      for(let i=0; i<8; i++) spawnEnemy(PieceType.PAWN);
-      for(let i=0; i<4; i++) spawnEnemy(PieceType.KNIGHT);
-      for(let i=0; i<2; i++) spawnEnemy(PieceType.ROOK);
-    } else {
-      // Multiplayer: Spawn neutral minions
-      for(let i=0; i<20; i++) spawnNeutralMinion();
-    }
+    for(let i=0; i<8; i++) spawnEnemy(PieceType.PAWN);
+    for(let i=0; i<4; i++) spawnEnemy(PieceType.KNIGHT);
+    for(let i=0; i<2; i++) spawnEnemy(PieceType.ROOK);
 
     setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
     
@@ -120,6 +374,7 @@ export default function App() {
   };
 
   const togglePause = () => {
+    if (gameModeRef.current === 'multi') return;
     if (!isPlayingRef.current || gameStateRef.current?.gameOver || gameStateRef.current?.gameWon) return;
     
     isPausedRef.current = !isPausedRef.current;
@@ -182,25 +437,45 @@ export default function App() {
   };
 
   const createRoom = () => {
-    socketRef.current?.emit('create-room');
+    setMultiState(prev => ({ ...prev, error: '' }));
+    socketRef.current?.emit('create-room', { matchType: 'versus' });
+  };
+
+  const normalizeJoinCode = (value: string) => {
+    const trimmed = value.trim();
+    if (!trimmed) return '';
+
+    try {
+      const parsedUrl = new URL(trimmed);
+      const roomParam = Array.from(parsedUrl.searchParams.entries()).find(
+        ([key]) => key.toLowerCase() === 'room'
+      )?.[1];
+      if (roomParam) {
+        return roomParam.toUpperCase();
+      }
+    } catch {
+      // Plain room code input should fall through.
+    }
+
+    const roomMatch = trimmed.match(/[?&]room=([^&#]+)/i);
+    if (roomMatch?.[1]) {
+      return decodeURIComponent(roomMatch[1]).toUpperCase();
+    }
+
+    return trimmed.toUpperCase();
   };
 
   const joinRoom = () => {
-    if (joinCode.trim()) {
-      socketRef.current?.emit('join-room', joinCode.trim());
+    const normalizedCode = normalizeJoinCode(joinCode);
+    if (normalizedCode) {
+      setMultiState(prev => ({ ...prev, error: '' }));
+      setJoinCode(normalizedCode);
+      socketRef.current?.emit('join-room', normalizedCode);
     }
   };
 
   const leaveRoom = () => {
-    socketRef.current?.emit('leave-room');
-    setGameMode(null);
-    setMultiState({
-      players: [],
-      roomCode: '',
-      isHost: false,
-      status: 'lobby',
-      error: null
-    });
+    resetToMenu(true);
   };
 
   const startGameMulti = () => {
@@ -208,7 +483,7 @@ export default function App() {
   };
 
   const copyRoomCode = () => {
-    const url = window.location.origin + '?room=' + multiState.roomCode;
+    const url = `${window.location.origin}${window.location.pathname}?room=${multiState.roomCode}`;
     navigator.clipboard.writeText(url);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
@@ -430,6 +705,7 @@ export default function App() {
   };
 
   const simulateStep = () => {
+    if (gameMode === 'multi') return;
     if (!gameStateRef.current || gameStateRef.current.gameOver || gameStateRef.current.gameWon) return;
     const state = gameStateRef.current;
     const { player, allies, enemies, particles, damageTexts, walls } = state;
@@ -616,24 +892,6 @@ export default function App() {
     if (state.screenShake > 0) state.screenShake *= 0.9;
     if (state.screenShake < 0.5) state.screenShake = 0;
 
-    // Multiplayer Sync
-    if (gameMode === 'multi' && socketRef.current?.id) {
-      socketRef.current.emit('sync-state', {
-        roomCode: multiState.roomCode,
-        state: {
-          id: socketRef.current.id,
-          pos: player.pos,
-          hp: player.hp,
-          maxHp: player.maxHp,
-          facingAngle: player.facingAngle,
-          isDead: player.isDead,
-          team: player.team,
-          type: player.type,
-          radius: player.radius
-        }
-      });
-    }
-
     if (player.hp <= 0) {
       state.gameOver = true;
       setIsPlaying(false);
@@ -665,7 +923,11 @@ export default function App() {
     if (accumulatorRef.current > 100) accumulatorRef.current = 100; // Cap to prevent spiral of death
 
     while (accumulatorRef.current >= TIME_STEP) {
-      simulateStep();
+      if (gameModeRef.current === 'multi') {
+        predictMultiplayerStep();
+      } else {
+        simulateStep();
+      }
       accumulatorRef.current -= TIME_STEP;
     }
 
@@ -853,31 +1115,41 @@ export default function App() {
     const allEntities = [state.player, ...Object.values(state.remotePlayers), ...state.allies, ...state.enemies].sort((a, b) => a.pos.y - b.pos.y);
     allEntities.forEach(e => drawEntity(ctx, e, now));
 
-    // Attack Arc
-    if (now - state.player.lastAttackTime < 150) {
-      ctx.save();
-      ctx.translate(state.player.pos.x, state.player.pos.y);
-      ctx.rotate(state.player.facingAngle);
-      ctx.beginPath();
-      ctx.arc(0, 0, state.player.attackRange, -Math.PI / 3, Math.PI / 3);
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)';
-      ctx.lineWidth = 15;
-      ctx.lineCap = 'round';
-      ctx.stroke();
-      ctx.restore();
-    }
+    const effectEntities = [state.player, ...Object.values(state.remotePlayers), ...state.enemies];
 
-    // Skill Effect
-    if (now - state.player.lastSkillTime < 500) {
-      const progress = (now - state.player.lastSkillTime) / 500;
-      ctx.beginPath();
-      ctx.arc(state.player.pos.x, state.player.pos.y, 300 * progress, 0, Math.PI * 2);
-      ctx.strokeStyle = `rgba(59, 130, 246, ${1 - progress})`;
-      ctx.lineWidth = 20 * (1 - progress);
-      ctx.stroke();
-      ctx.fillStyle = `rgba(59, 130, 246, ${(1 - progress) * 0.3})`;
-      ctx.fill();
-    }
+    effectEntities.forEach(entity => {
+      const isBoss = entity.type === PieceType.KING && entity.team === Team.RED;
+      const isLocalPlayer = entity.id === 'player';
+
+      if (now - entity.lastAttackTime < 180) {
+        ctx.save();
+        ctx.translate(entity.pos.x, entity.pos.y);
+        ctx.rotate(entity.facingAngle);
+        ctx.beginPath();
+        ctx.arc(0, 0, entity.attackRange, -Math.PI / 3, Math.PI / 3);
+        ctx.strokeStyle = isBoss ? 'rgba(239, 68, 68, 0.8)' : 'rgba(255, 255, 255, 0.8)';
+        ctx.lineWidth = isBoss ? 18 : 15;
+        ctx.lineCap = 'round';
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      if (now - entity.lastSkillTime < 550) {
+        const progress = (now - entity.lastSkillTime) / 550;
+        const alpha = Math.max(0, 1 - progress);
+        ctx.beginPath();
+        ctx.arc(entity.pos.x, entity.pos.y, (isBoss ? 320 : 300) * progress, 0, Math.PI * 2);
+        ctx.strokeStyle = isBoss
+          ? `rgba(239, 68, 68, ${alpha})`
+          : `rgba(59, 130, 246, ${alpha})`;
+        ctx.lineWidth = (isBoss ? 18 : 20) * alpha;
+        ctx.stroke();
+        ctx.fillStyle = isBoss
+          ? `rgba(127, 29, 29, ${alpha * 0.18})`
+          : `rgba(59, 130, 246, ${alpha * 0.3})`;
+        ctx.fill();
+      }
+    });
 
     // Particles
     state.particles.forEach(p => {
@@ -906,10 +1178,19 @@ export default function App() {
   };
 
   useEffect(() => {
+    gameModeRef.current = gameMode;
+  }, [gameMode]);
+
+  useEffect(() => {
+    roomCodeRef.current = multiState.roomCode;
+  }, [multiState.roomCode]);
+
+  useEffect(() => {
     // Check for room code in URL
     const params = new URLSearchParams(window.location.search);
     const roomFromUrl = params.get('room');
     if (roomFromUrl) {
+      pendingAutoJoinRef.current = roomFromUrl.toUpperCase();
       setJoinCode(roomFromUrl.toUpperCase());
       setGameMode('multi');
     }
@@ -917,36 +1198,38 @@ export default function App() {
     // Initialize Socket
     socketRef.current = io();
 
+    socketRef.current.on('connect', () => {
+      if (pendingAutoJoinRef.current) {
+        socketRef.current?.emit('join-room', pendingAutoJoinRef.current);
+        pendingAutoJoinRef.current = '';
+      }
+    });
+
     socketRef.current.on('room-created', (code) => {
-      setMultiState(prev => ({ ...prev, roomCode: code, isHost: true, status: 'lobby' }));
+      setMultiState(prev => ({ ...prev, roomCode: code, isHost: true, status: 'lobby', error: '' }));
     });
 
     socketRef.current.on('room-joined', (code) => {
-      setMultiState(prev => ({ ...prev, roomCode: code, isHost: false, status: 'lobby' }));
+      setMultiState(prev => ({ ...prev, roomCode: code, isHost: false, status: 'lobby', error: '' }));
     });
 
     socketRef.current.on('room-update', (data) => {
-      setMultiState(prev => ({ ...prev, players: data.players }));
-      if (gameStateRef.current) {
-        const currentRemoteIds = Object.keys(gameStateRef.current.remotePlayers);
-        currentRemoteIds.forEach(id => {
-          if (!data.players.includes(id)) {
-            delete gameStateRef.current.remotePlayers[id];
-          }
-        });
-      }
+      setMultiState(prev => ({
+        ...prev,
+        players: data.players,
+        isHost: data.hostId === socketRef.current?.id,
+        status: data.status ?? prev.status,
+        matchType: data.matchType ?? prev.matchType
+      }));
     });
 
     socketRef.current.on('game-started', () => {
       setMultiState(prev => ({ ...prev, status: 'playing' }));
-      setIsPlaying(true);
       initGame('multi');
     });
 
-    socketRef.current.on('remote-sync', (data) => {
-      if (gameStateRef.current) {
-        gameStateRef.current.remotePlayers[data.id] = { ...data.state, id: 'remote-' + data.id };
-      }
+    socketRef.current.on('game-state', (snapshot: MultiplayerSnapshot) => {
+      applyMultiplayerSnapshot(snapshot);
     });
 
     socketRef.current.on('error-message', (msg) => {
@@ -971,6 +1254,16 @@ export default function App() {
     updateSize();
     window.addEventListener('resize', updateSize);
 
+    const emitKeyboardInput = () => {
+      const moveX = (keysPressed.current.has('ArrowRight') || keysPressed.current.has('d') || keysPressed.current.has('D') ? 1 : 0)
+        - (keysPressed.current.has('ArrowLeft') || keysPressed.current.has('a') || keysPressed.current.has('A') ? 1 : 0);
+      const moveY = (keysPressed.current.has('ArrowDown') || keysPressed.current.has('s') || keysPressed.current.has('S') ? 1 : 0)
+        - (keysPressed.current.has('ArrowUp') || keysPressed.current.has('w') || keysPressed.current.has('W') ? 1 : 0);
+      const attack = keysPressed.current.has('z') || keysPressed.current.has('Z') || keysPressed.current.has('j') || keysPressed.current.has('J');
+      const skill = keysPressed.current.has('x') || keysPressed.current.has('X') || keysPressed.current.has('k') || keysPressed.current.has('K');
+      syncMultiInput({ moveX, moveY, attack, skill });
+    };
+
     const handleKeyDown = (e: KeyboardEvent) => {
       if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
         e.preventDefault();
@@ -979,9 +1272,16 @@ export default function App() {
         togglePause();
       }
       keysPressed.current.add(e.key);
+      emitKeyboardInput();
     };
-    const handleKeyUp = (e: KeyboardEvent) => keysPressed.current.delete(e.key);
-    const handleBlur = () => keysPressed.current.clear();
+    const handleKeyUp = (e: KeyboardEvent) => {
+      keysPressed.current.delete(e.key);
+      emitKeyboardInput();
+    };
+    const handleBlur = () => {
+      keysPressed.current.clear();
+      syncMultiInput({ moveX: 0, moveY: 0, attack: false, skill: false });
+    };
 
     window.addEventListener('keydown', handleKeyDown, { passive: false });
     window.addEventListener('keyup', handleKeyUp);
@@ -1022,21 +1322,27 @@ export default function App() {
     
     setJoystick(prev => ({ ...prev, x: limitedX, y: limitedY }));
     joystickRef.current = { x: limitedX / maxDist, y: limitedY / maxDist };
+    syncMultiInput({ moveX: limitedX / maxDist, moveY: limitedY / maxDist });
   };
 
   const handleJoystickEnd = () => {
     setJoystick({ active: false, x: 0, y: 0, startX: 0, startY: 0 });
     joystickRef.current = { x: 0, y: 0 };
+    syncMultiInput({ moveX: 0, moveY: 0 });
   };
 
   const triggerAttack = () => {
     keysPressed.current.add('z');
+    syncMultiInput({ attack: true });
     setTimeout(() => keysPressed.current.delete('z'), 100);
+    setTimeout(() => syncMultiInput({ attack: false }), 100);
   };
 
   const triggerSkill = () => {
     keysPressed.current.add('x');
+    syncMultiInput({ skill: true });
     setTimeout(() => keysPressed.current.delete('x'), 100);
+    setTimeout(() => syncMultiInput({ skill: false }), 100);
   };
 
   return (
@@ -1073,16 +1379,22 @@ export default function App() {
             <div className="flex gap-2">
               <button 
                 onClick={togglePause} 
-                disabled={!isPlaying || uiState.gameOver || uiState.gameWon}
+                disabled={!isPlaying || uiState.gameOver || uiState.gameWon || gameMode === 'multi'}
                 className="p-3 bg-zinc-900/80 rounded-2xl border-2 border-zinc-800 hover:bg-zinc-800 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                title="Pause (P or Esc)"
+                title={gameMode === 'multi' ? 'Pause unavailable in multiplayer' : 'Pause (P or Esc)'}
               >
                 {isPaused ? <Play className="w-6 h-6" /> : <Pause className="w-6 h-6" />}
               </button>
               <button 
-                onClick={() => initGame(gameMode || 'single')} 
+                onClick={() => {
+                  if (gameMode === 'multi') {
+                    leaveRoom();
+                    return;
+                  }
+                  initGame('single');
+                }} 
                 className="p-3 bg-zinc-900/80 rounded-2xl border-2 border-zinc-800 hover:bg-red-900/50 hover:border-red-800 text-white transition-colors"
-                title="Restart"
+                title={gameMode === 'multi' ? 'Leave Room' : 'Restart'}
               >
                 <RotateCcw className="w-6 h-6" />
               </button>
@@ -1144,6 +1456,7 @@ export default function App() {
                 <div className="text-center">
                   <h2 className="text-4xl font-black italic text-white tracking-tighter mb-2">MULTIPLAYER <span className="text-red-600">LOBBY</span></h2>
                   {multiState.roomCode && <p className="text-zinc-500 font-bold uppercase text-xs">Room: {multiState.roomCode}</p>}
+                  <p className="text-zinc-600 font-bold uppercase text-[10px] mt-2 tracking-[0.3em]">Versus Mode</p>
                 </div>
 
                 {!multiState.roomCode ? (
@@ -1155,7 +1468,7 @@ export default function App() {
                       <UserPlus className="w-6 h-6 text-blue-500" />
                       <div className="text-left">
                         <h3 className="text-xl font-black text-white italic">CREATE ROOM</h3>
-                        <p className="text-xs text-zinc-500 font-bold">Start a new battle</p>
+                        <p className="text-xs text-zinc-500 font-bold">Start a versus battle</p>
                       </div>
                     </button>
 
@@ -1163,9 +1476,9 @@ export default function App() {
                       <div className="relative">
                         <input 
                           type="text" 
-                          placeholder="ENTER ROOM CODE"
+                          placeholder="ENTER ROOM CODE OR INVITE LINK"
                           value={joinCode}
-                          onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
+                          onChange={(e) => setJoinCode(e.target.value)}
                           className="w-full p-6 bg-zinc-900 border-2 border-zinc-800 rounded-3xl text-white font-black italic focus:border-red-500 outline-none transition-all placeholder:text-zinc-700"
                         />
                         <button 
@@ -1179,7 +1492,7 @@ export default function App() {
                     </div>
                     
                     <button 
-                      onClick={() => setGameMode(null)}
+                      onClick={() => resetToMenu(false)}
                       className="w-full p-4 bg-zinc-900 border-2 border-zinc-800 rounded-2xl text-zinc-500 font-black italic hover:text-white transition-all mt-4"
                     >
                       BACK TO MENU
@@ -1232,7 +1545,7 @@ export default function App() {
                 )}
 
                 <button 
-                  onClick={() => { setGameMode(null); setMultiState(prev => ({ ...prev, roomCode: '', error: '' })); }}
+                  onClick={() => resetToMenu(Boolean(multiState.roomCode))}
                   className="text-zinc-600 font-black uppercase text-[10px] tracking-widest hover:text-zinc-400 transition-colors"
                 >
                   BACK TO MENU
@@ -1248,7 +1561,7 @@ export default function App() {
           height={canvasSize.height}
           className={isMobile ? "w-full h-full block" : "bg-black block"}
           onClick={() => {
-            if (!isPlaying && !uiState.gameOver && !uiState.gameWon) initGame(gameMode || 'single');
+            if (!isPlaying && !uiState.gameOver && !uiState.gameWon && gameMode === 'single') initGame('single');
             if (!isMobile) window.focus();
           }}
         />
@@ -1322,6 +1635,7 @@ export default function App() {
             
             <button 
               onClick={togglePause}
+              disabled={gameMode === 'multi'}
               className="p-4 bg-white/10 hover:bg-white/20 rounded-2xl border border-white/20 backdrop-blur-md pointer-events-auto transition-colors shadow-xl"
             >
               {isPaused ? <Play className="w-6 h-6 fill-white" /> : <Pause className="w-6 h-6 fill-white" />}
@@ -1382,36 +1696,6 @@ export default function App() {
 
       {/* Overlays (Start, Game Over, Pause) */}
       <AnimatePresence>
-        {!isPlaying && !uiState.gameOver && !uiState.gameWon && (
-          <motion.div 
-            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/90 backdrop-blur-xl p-8 text-center"
-          >
-            <motion.div
-              initial={{ scale: 0.8, y: 20 }} animate={{ scale: 1, y: 0 }}
-              className="max-w-md"
-            >
-              <h1 className="text-7xl font-black italic tracking-tighter text-red-600 mb-2 drop-shadow-[0_0_30px_rgba(220,38,38,0.5)]">
-                DARK ZONE
-              </h1>
-              <p className="text-zinc-400 text-sm uppercase tracking-[0.3em] mb-12 font-bold">
-                Piece Survival Skirmish
-              </p>
-              
-              <button
-                onClick={() => initGame(gameMode || 'single')}
-                className="group relative px-12 py-6 bg-red-600 hover:bg-red-500 transition-all rounded-full overflow-hidden shadow-[0_0_50px_rgba(220,38,38,0.3)]"
-              >
-                <div className="relative z-10 flex items-center gap-4">
-                  <Play className="w-8 h-8 fill-white" />
-                  <span className="text-2xl font-black italic uppercase tracking-tighter">ENTER THE ZONE</span>
-                </div>
-                <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent -translate-x-full group-hover:translate-x-full transition-transform duration-1000" />
-              </button>
-            </motion.div>
-          </motion.div>
-        )}
-
         {isPaused && (
           <motion.div 
             initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
@@ -1426,7 +1710,7 @@ export default function App() {
                 RESUME MISSION
               </button>
               <button 
-                onClick={() => { setIsPlaying(false); setGameMode(null); if(isPaused) togglePause(); }}
+                onClick={() => resetToMenu(gameMode === 'multi')}
                 className="w-full py-4 bg-zinc-900 border-2 border-zinc-800 rounded-2xl text-zinc-500 font-black italic hover:text-white transition-all mt-4"
               >
                 QUIT TO MENU
@@ -1470,14 +1754,20 @@ export default function App() {
               </div>
 
               <button
-                onClick={() => initGame(gameMode || 'single')}
+                onClick={() => {
+                  if (gameMode === 'multi') {
+                    resetToMenu(true);
+                    return;
+                  }
+                  initGame('single');
+                }}
                 className="flex items-center gap-4 px-12 py-6 bg-white text-black rounded-full font-black italic text-2xl hover:scale-105 transition-transform shadow-xl"
               >
                 <RotateCcw className="w-8 h-8" />
-                REDEPLOY
+                {gameMode === 'multi' ? 'LEAVE ROOM' : 'REDEPLOY'}
               </button>
               <button 
-                onClick={() => { setIsPlaying(false); setGameMode(null); }}
+                onClick={() => resetToMenu(gameMode === 'multi')}
                 className="w-full py-4 bg-zinc-900 border-2 border-zinc-800 rounded-2xl text-zinc-500 font-black italic hover:text-white transition-all mt-4"
               >
                 BACK TO MENU

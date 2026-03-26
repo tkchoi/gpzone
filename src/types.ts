@@ -47,6 +47,8 @@ export interface Entity {
   id: string;
   type: PieceType;
   team: Team;
+  ownerId?: string;
+  lastProcessedInputSeq?: number;
   pos: Position;
   hp: number;
   maxHp: number;
@@ -62,6 +64,7 @@ export interface Entity {
   facingAngle: number;
   pushVelocity: Position;
   lastHitTime: number;
+  lastDamagedBy?: string;
 }
 
 export interface Particle {
