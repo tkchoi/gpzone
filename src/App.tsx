@@ -1461,8 +1461,6 @@ export default function App() {
         if (gameModeRef.current === 'multi') {
           predictMultiplayerStep();
           if (gameStateRef.current) {
-            interpolateRemotePlayers(gameStateRef.current);
-            interpolateNetworkUnits(gameStateRef.current);
             updateVisualEffects(gameStateRef.current);
           }
         } else {
@@ -1472,6 +1470,12 @@ export default function App() {
         updateVisualEffects(gameStateRef.current);
       }
       accumulatorRef.current -= currentTimeStep;
+    }
+
+    // Render-time interpolation runs every frame (not only fixed ticks) for smoother motion.
+    if (gameModeRef.current === 'multi' && gameStateRef.current) {
+      interpolateRemotePlayers(gameStateRef.current);
+      interpolateNetworkUnits(gameStateRef.current);
     }
 
     draw(gameStateRef.current, Date.now() - totalPausedTimeRef.current);
