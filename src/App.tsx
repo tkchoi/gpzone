@@ -72,6 +72,7 @@ export default function App() {
   // Mobile Control States
   const [joystick, setJoystick] = useState({ active: false, x: 0, y: 0, startX: 0, startY: 0 });
   const joystickRef = useRef({ x: 0, y: 0 });
+  const joystickTouchIdRef = useRef<number | null>(null);
   const [isMobile, setIsMobile] = useState(false);
   const [canvasSize, setCanvasSize] = useState({ width: 800, height: 600 });
   
@@ -200,6 +201,7 @@ export default function App() {
   const clearTransientInputs = () => {
     keysPressed.current.clear();
     joystickRef.current = { x: 0, y: 0 };
+    joystickTouchIdRef.current = null;
     setJoystick({ active: false, x: 0, y: 0, startX: 0, startY: 0 });
     if (attackReleaseTimeoutRef.current !== null) {
       window.clearTimeout(attackReleaseTimeoutRef.current);
@@ -487,6 +489,7 @@ export default function App() {
   const initGame = (mode: 'single' | 'multi' = 'single') => {
     keysPressed.current.clear();
     joystickRef.current = { x: 0, y: 0 };
+    joystickTouchIdRef.current = null;
     setJoystick({ active: false, x: 0, y: 0, startX: 0, startY: 0 });
 
     if (mode === 'multi') {
@@ -723,6 +726,8 @@ export default function App() {
       setMultiState(prev => ({ ...prev, error: 'Room code unavailable' }));
       return;
     }
+    clearTransientInputs();
+    syncMultiInput({ moveX: 0, moveY: 0, attack: false, skill: false });
     socketRef.current.emit('retry-game', code);
   };
 
@@ -1617,13 +1622,19 @@ export default function App() {
   }, [isPlaying]);
 
   const handleJoystickStart = (e: React.TouchEvent) => {
-    const touch = e.touches[0];
+    e.preventDefault();
+    const touch = e.changedTouches[0];
+    joystickTouchIdRef.current = touch.identifier;
     setJoystick({ active: true, x: 0, y: 0, startX: touch.clientX, startY: touch.clientY });
   };
 
   const handleJoystickMove = (e: React.TouchEvent) => {
+    e.preventDefault();
     if (!joystick.active) return;
-    const touch = e.touches[0];
+    const touchId = joystickTouchIdRef.current;
+    if (touchId === null) return;
+    const touch = Array.from(e.touches).find((t) => t.identifier === touchId);
+    if (!touch) return;
     const dx = touch.clientX - joystick.startX;
     const dy = touch.clientY - joystick.startY;
     const dist = Math.sqrt(dx * dx + dy * dy);
@@ -1637,7 +1648,16 @@ export default function App() {
     syncMultiInput({ moveX: limitedX / maxDist, moveY: limitedY / maxDist });
   };
 
-  const handleJoystickEnd = () => {
+  const handleJoystickEnd = (e?: React.TouchEvent) => {
+    if (e) {
+      e.preventDefault();
+      const touchId = joystickTouchIdRef.current;
+      if (touchId !== null) {
+        const ended = Array.from(e.changedTouches).some((t) => t.identifier === touchId);
+        if (!ended) return;
+      }
+    }
+    joystickTouchIdRef.current = null;
     setJoystick({ active: false, x: 0, y: 0, startX: 0, startY: 0 });
     joystickRef.current = { x: 0, y: 0 };
     syncMultiInput({ moveX: 0, moveY: 0 });
@@ -1899,6 +1919,7 @@ export default function App() {
               onTouchStart={handleJoystickStart}
               onTouchMove={handleJoystickMove}
               onTouchEnd={handleJoystickEnd}
+              onTouchCancel={handleJoystickEnd}
             >
               <div className="w-24 h-24 rounded-full bg-white/10 border-2 border-white/20 flex items-center justify-center backdrop-blur-sm">
                 <div className="w-12 h-12 rounded-full bg-white/5 border border-white/10" />
