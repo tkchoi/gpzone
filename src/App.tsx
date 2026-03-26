@@ -87,7 +87,8 @@ export default function App() {
   const roomCodeRef = useRef('');
   const pendingAutoJoinRef = useRef('');
   const inputSeqRef = useRef(0);
-  const previousRemotePlayersRef = useRef<Record<string, Entity>>({});
+  const serverPlayerRef = useRef<Entity | null>(null);
+  const serverRemotePlayersRef = useRef<Record<string, Entity>>({});
 
   const isPlayingRef = useRef(false);
   const isPausedRef = useRef(false);
@@ -120,7 +121,7 @@ export default function App() {
     lastHitTime: 0,
   });
 
-  const applyPredictedMovement = (player: Entity, input: MultiplayerInputState) => {
+  const applyPredictedMovement = (player: Entity, input: MultiplayerInputState, walls: Wall[]) => {
     player.pos.x += player.pushVelocity.x;
     player.pos.y += player.pushVelocity.y;
     player.pushVelocity.x *= 0.82;
@@ -138,34 +139,7 @@ export default function App() {
     const margin = 60 + player.radius;
     player.pos.x = Math.max(margin, Math.min(MAP_WIDTH - margin, player.pos.x));
     player.pos.y = Math.max(margin, Math.min(MAP_HEIGHT - margin, player.pos.y));
-  };
-
-  const blendEntityPosition = (prev: Entity | undefined, next: Entity, factor: number) => {
-    if (!prev) return next;
-    const dx = next.pos.x - prev.pos.x;
-    const dy = next.pos.y - prev.pos.y;
-    const dist = Math.hypot(dx, dy);
-
-    if (dist < 3) {
-      return {
-        ...next,
-        pos: { ...prev.pos },
-        facingAngle: prev.facingAngle,
-      };
-    }
-
-    if (dist > 90) {
-      return next;
-    }
-
-    return {
-      ...next,
-      pos: {
-        x: prev.pos.x + dx * factor,
-        y: prev.pos.y + dy * factor,
-      },
-      facingAngle: prev.facingAngle + (next.facingAngle - prev.facingAngle) * factor,
-    };
+    resolveWallCollision(player, walls);
   };
 
   const predictMultiplayerStep = () => {
@@ -174,7 +148,79 @@ export default function App() {
 
     const player = state.player;
     const currentInput = multiInputRef.current;
-    applyPredictedMovement(player, currentInput);
+    applyPredictedMovement(player, currentInput, state.walls);
+  };
+
+  const normalizeAngleDelta = (delta: number) => {
+    while (delta > Math.PI) delta -= Math.PI * 2;
+    while (delta < -Math.PI) delta += Math.PI * 2;
+    return delta;
+  };
+
+  const reconcileMultiplayerState = () => {
+    const state = gameStateRef.current;
+    const serverPlayer = serverPlayerRef.current;
+    if (!state || !serverPlayer) return;
+
+    const player = state.player;
+    const playerDx = serverPlayer.pos.x - player.pos.x;
+    const playerDy = serverPlayer.pos.y - player.pos.y;
+    const playerDist = Math.hypot(playerDx, playerDy);
+
+    if (playerDist > 140) {
+      player.pos = { ...serverPlayer.pos };
+    } else if (playerDist > 2) {
+      const correction = playerDist > 48 ? 0.28 : 0.14;
+      player.pos.x += playerDx * correction;
+      player.pos.y += playerDy * correction;
+    }
+
+    const playerAngleDelta = normalizeAngleDelta(serverPlayer.facingAngle - player.facingAngle);
+    player.facingAngle += playerAngleDelta * 0.2;
+    player.hp = serverPlayer.hp;
+    player.maxHp = serverPlayer.maxHp;
+    player.isDead = serverPlayer.isDead;
+    player.lastAttackTime = serverPlayer.lastAttackTime;
+    player.lastSkillTime = serverPlayer.lastSkillTime;
+    player.lastHitTime = serverPlayer.lastHitTime;
+    player.pushVelocity = { ...serverPlayer.pushVelocity };
+    player.lastProcessedInputSeq = serverPlayer.lastProcessedInputSeq;
+
+    const nextRemotePlayers: Record<string, Entity> = {};
+
+    for (const [id, target] of Object.entries(serverRemotePlayersRef.current) as [string, Entity][]) {
+      const current = state.remotePlayers[id];
+
+      if (!current) {
+        nextRemotePlayers[id] = { ...target };
+        continue;
+      }
+
+      const dx = target.pos.x - current.pos.x;
+      const dy = target.pos.y - current.pos.y;
+      const dist = Math.hypot(dx, dy);
+      let pos = current.pos;
+
+      if (dist > 180) {
+        pos = { ...target.pos };
+      } else if (dist > 0.75) {
+        const step = Math.min(18, Math.max(3, dist * 0.35));
+        const ratio = Math.min(1, step / dist);
+        pos = {
+          x: current.pos.x + dx * ratio,
+          y: current.pos.y + dy * ratio,
+        };
+      }
+
+      const angleDelta = normalizeAngleDelta(target.facingAngle - current.facingAngle);
+      nextRemotePlayers[id] = {
+        ...target,
+        pos,
+        facingAngle: current.facingAngle + angleDelta * 0.3,
+      };
+    }
+
+    state.remotePlayers = nextRemotePlayers;
   };
 
   const syncMultiInput = (patch: Partial<MultiplayerInputState> = {}) => {
@@ -215,7 +261,8 @@ export default function App() {
     setGameMode(null);
     setJoinCode('');
     inputSeqRef.current = 0;
-    previousRemotePlayersRef.current = {};
+    serverPlayerRef.current = null;
+    serverRemotePlayersRef.current = {};
     multiInputRef.current = { seq: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
     multiOutcomeRef.current = { gameOver: false, gameWon: false };
     setMultiState({ roomCode: '', isHost: false, players: [], status: 'lobby', matchType: 'versus', error: '' });
@@ -228,38 +275,39 @@ export default function App() {
     if (!socketId) return;
     setMultiState(prev => ({ ...prev, matchType: snapshot.matchType }));
 
-    const serverPlayer = snapshot.players[socketId] ?? createEmptyPlayer();
-    const previousPlayer = gameStateRef.current?.player;
-    const localPlayer = { ...serverPlayer, id: 'player' };
+    const authoritativePlayer = { ...(snapshot.players[socketId] ?? createEmptyPlayer()), id: 'player' };
+    serverPlayerRef.current = authoritativePlayer;
 
-    if (previousPlayer && !snapshot.gameOver && !snapshot.gameWon) {
-      const dx = localPlayer.pos.x - previousPlayer.pos.x;
-      const dy = localPlayer.pos.y - previousPlayer.pos.y;
-      const dist = Math.hypot(dx, dy);
-      if (dist < 6) {
-        localPlayer.pos = { ...previousPlayer.pos };
-      } else if (dist < 80) {
-        localPlayer.pos = {
-          x: previousPlayer.pos.x + dx * 0.2,
-          y: previousPlayer.pos.y + dy * 0.2,
-        };
-      }
-    }
-
-    const remotePlayers = Object.fromEntries(
-      Object.entries(snapshot.players)
+    const remoteTargets: Record<string, Entity> = Object.fromEntries(
+      (Object.entries(snapshot.players) as [string, Entity][])
         .filter(([id]) => id !== socketId)
-        .map(([id, player]) => {
-          const prev = previousRemotePlayersRef.current[id];
-          const blended = blendEntityPosition(prev, { ...player, id: `remote-${id}` }, 0.45);
-          return [id, blended];
-        })
+        .map(([id, player]) => [id, { ...player, id: `remote-${id}` }])
     );
-    previousRemotePlayersRef.current = remotePlayers;
+    serverRemotePlayersRef.current = remoteTargets;
+
+    const currentState = gameStateRef.current;
+    const localPlayer = currentState?.player
+      ? {
+          ...currentState.player,
+          hp: authoritativePlayer.hp,
+          maxHp: authoritativePlayer.maxHp,
+          isDead: authoritativePlayer.isDead,
+          lastAttackTime: authoritativePlayer.lastAttackTime,
+          lastSkillTime: authoritativePlayer.lastSkillTime,
+          lastHitTime: authoritativePlayer.lastHitTime,
+          pushVelocity: { ...authoritativePlayer.pushVelocity },
+          attackCooldown: authoritativePlayer.attackCooldown,
+          skillCooldown: authoritativePlayer.skillCooldown,
+          attackRange: authoritativePlayer.attackRange,
+          attackDamage: authoritativePlayer.attackDamage,
+          facingAngle: authoritativePlayer.facingAngle,
+          lastProcessedInputSeq: authoritativePlayer.lastProcessedInputSeq,
+        }
+      : authoritativePlayer;
 
     gameStateRef.current = {
       player: localPlayer,
-      remotePlayers,
+      remotePlayers: currentState?.remotePlayers ?? {},
       allies: snapshot.allies,
       enemies: snapshot.enemies,
       particles: [],
@@ -308,7 +356,8 @@ export default function App() {
 
     if (mode === 'multi') {
       inputSeqRef.current = 0;
-      previousRemotePlayersRef.current = {};
+      serverPlayerRef.current = null;
+      serverRemotePlayersRef.current = {};
       multiInputRef.current = { seq: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
       multiOutcomeRef.current = { gameOver: false, gameWon: false };
       gameStateRef.current = {
@@ -936,6 +985,7 @@ export default function App() {
     while (accumulatorRef.current >= TIME_STEP) {
       if (gameModeRef.current === 'multi') {
         predictMultiplayerStep();
+        reconcileMultiplayerState();
       } else {
         simulateStep();
       }
