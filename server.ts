@@ -720,6 +720,7 @@ function buildSnapshotForSocket(room: RoomState, socketId: string) {
     screenShake: room.screenShake,
     status: room.status,
     matchType: room.matchType,
+    serverTime: Date.now(),
   };
 }
 
