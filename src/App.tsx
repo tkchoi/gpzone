@@ -94,6 +94,7 @@ export default function App() {
   const [multiScores, setMultiScores] = useState<Record<string, number>>({});
   const [joinCode, setJoinCode] = useState('');
   const [copied, setCopied] = useState(false);
+  const [syncRecovery, setSyncRecovery] = useState({ active: false, retrying: false, message: '' });
   const socketRef = useRef<Socket | null>(null);
   const multiInputRef = useRef<MultiplayerInputState>({ seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false });
   const multiOutcomeRef = useRef({ gameOver: false, gameWon: false });
@@ -119,6 +120,8 @@ export default function App() {
     lastServerTime: 0,
     lastLocalReceiveTime: 0,
   });
+  const lastSnapshotAtRef = useRef(0);
+  const syncRetryCountRef = useRef(0);
 
   const isPlayingRef = useRef(false);
   const isPausedRef = useRef(false);
@@ -251,6 +254,9 @@ export default function App() {
     window.history.replaceState({}, '', window.location.pathname);
     setGameMode(null);
     setJoinCode('');
+    setSyncRecovery({ active: false, retrying: false, message: '' });
+    lastSnapshotAtRef.current = 0;
+    syncRetryCountRef.current = 0;
     inputSeqRef.current = 0;
     roundIdRef.current = 0;
     pendingInputsRef.current = [];
@@ -283,6 +289,8 @@ export default function App() {
     const socketId = socketRef.current?.id;
     if (!socketId) return;
     if (snapshot.roundId < roundIdRef.current) return;
+    lastSnapshotAtRef.current = Date.now();
+    setSyncRecovery(prev => (prev.active ? { active: false, retrying: false, message: '' } : prev));
     const localReceiveTime = Date.now();
     const observedDelay = Math.max(0, localReceiveTime - snapshot.serverTime);
     const timing = networkTimingRef.current;
@@ -886,6 +894,86 @@ export default function App() {
     setGameMode(null);
     setJoinCode('');
     setMultiState({ roomCode: '', isHost: false, players: [], status: 'lobby', matchType: 'versus', error: '' });
+    setSyncRecovery({ active: false, retrying: false, message: '' });
+    lastSnapshotAtRef.current = 0;
+    syncRetryCountRef.current = 0;
+  };
+
+  const moveToLobbyFromSyncFailure = (message: string) => {
+    clearTransientInputs();
+    if (requestRef.current) cancelAnimationFrame(requestRef.current);
+    isPlayingRef.current = false;
+    setIsPlaying(false);
+    setIsPaused(false);
+    isPausedRef.current = false;
+    soundManager.stopBGM();
+    socketRef.current?.emit('leave-room');
+    roomCodeRef.current = '';
+    inputSeqRef.current = 0;
+    roundIdRef.current = 0;
+    pendingInputsRef.current = [];
+    remotePlayerTargetsRef.current = {};
+    remoteHistoryRef.current = {};
+    allyTargetsRef.current = {};
+    enemyTargetsRef.current = {};
+    allyHistoryRef.current = {};
+    enemyHistoryRef.current = {};
+    networkTimingRef.current = {
+      smoothedDelayMs: 80,
+      jitterMs: 0,
+      interpolationDelayMs: 110,
+      lastServerTime: 0,
+      lastLocalReceiveTime: 0,
+    };
+    lastAttackTimesRef.current = {};
+    attackFxTimesRef.current = {};
+    lastSnapshotAtRef.current = 0;
+    syncRetryCountRef.current = 0;
+    multiInputRef.current = { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
+    multiOutcomeRef.current = { gameOver: false, gameWon: false };
+    gameStateRef.current = null;
+    setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
+    setMultiScores({});
+    setGameMode('multi');
+    setJoinCode('');
+    setSyncRecovery({ active: false, retrying: false, message: '' });
+    setMultiState({ roomCode: '', isHost: false, players: [], status: 'lobby', matchType: 'versus', error: message });
+  };
+
+  const retryMultiplayerSync = () => {
+    if (!roomCodeRef.current) return;
+    syncRetryCountRef.current += 1;
+    setSyncRecovery({ active: true, retrying: true, message: 'Re-syncing state...' });
+    clearTransientInputs();
+    pendingInputsRef.current = [];
+    remotePlayerTargetsRef.current = {};
+    remoteHistoryRef.current = {};
+    allyTargetsRef.current = {};
+    enemyTargetsRef.current = {};
+    allyHistoryRef.current = {};
+    enemyHistoryRef.current = {};
+    networkTimingRef.current = {
+      smoothedDelayMs: 80,
+      jitterMs: 0,
+      interpolationDelayMs: 110,
+      lastServerTime: 0,
+      lastLocalReceiveTime: 0,
+    };
+    multiInputRef.current = {
+      ...multiInputRef.current,
+      seq: inputSeqRef.current,
+      roundId: roundIdRef.current,
+      clientTime: Date.now(),
+      moveX: 0,
+      moveY: 0,
+      attack: false,
+      skill: false,
+    };
+    socketRef.current?.emit('request-game-state', roomCodeRef.current);
+    socketRef.current?.emit('player-input', {
+      roomCode: roomCodeRef.current,
+      input: multiInputRef.current
+    });
   };
 
   const startGameMulti = () => {
@@ -1727,6 +1815,9 @@ export default function App() {
 
     socketRef.current.on('game-started', (data?: { roundId?: number }) => {
       roundIdRef.current = data?.roundId ?? roundIdRef.current + 1;
+      lastSnapshotAtRef.current = Date.now();
+      syncRetryCountRef.current = 0;
+      setSyncRecovery({ active: false, retrying: false, message: '' });
       clearTransientInputs();
       inputSeqRef.current = 0;
       pendingInputsRef.current = [];
@@ -1760,6 +1851,35 @@ export default function App() {
       socketRef.current?.disconnect();
     };
   }, []);
+
+  useEffect(() => {
+    const checkSync = () => {
+      if (gameModeRef.current !== 'multi') return;
+      if (!isPlayingRef.current || isPausedRef.current) return;
+      if (multiState.status !== 'playing' || uiState.gameOver || uiState.gameWon) return;
+      if (!roomCodeRef.current) return;
+      if (lastSnapshotAtRef.current === 0) return;
+
+      const staleMs = Date.now() - lastSnapshotAtRef.current;
+      if (staleMs < 2500) return;
+
+      if (syncRetryCountRef.current >= 1) {
+        moveToLobbyFromSyncFailure('Sync recovery failed. Returned to lobby.');
+        return;
+      }
+
+      if (!syncRecovery.active) {
+        setSyncRecovery({
+          active: true,
+          retrying: false,
+          message: 'Network sync is delayed. Retry sync or return to lobby.'
+        });
+      }
+    };
+
+    const timer = window.setInterval(checkSync, 500);
+    return () => window.clearInterval(timer);
+  }, [multiState.status, uiState.gameOver, uiState.gameWon, syncRecovery.active]);
 
   useEffect(() => {
     const updateSize = () => {
@@ -2161,6 +2281,30 @@ export default function App() {
                   />
                 </button>
                 <span className="text-[8px] font-black italic text-blue-400 tracking-widest drop-shadow-md">DASH</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {syncRecovery.active && isPlaying && !uiState.gameOver && !uiState.gameWon && (
+          <div className="absolute inset-0 z-40 bg-black/70 backdrop-blur-sm flex items-center justify-center p-6">
+            <div className="w-full max-w-md bg-zinc-900/95 border border-zinc-700 rounded-3xl p-6 text-center">
+              <h3 className="text-2xl font-black italic text-white mb-3">SYNC WARNING</h3>
+              <p className="text-sm text-zinc-300 mb-6">{syncRecovery.message}</p>
+              <div className="flex flex-col gap-3">
+                <button
+                  onClick={retryMultiplayerSync}
+                  disabled={syncRecovery.retrying}
+                  className="w-full px-6 py-4 bg-white text-black rounded-2xl font-black italic disabled:opacity-60"
+                >
+                  {syncRecovery.retrying ? 'RETRYING...' : 'RETRY SYNC'}
+                </button>
+                <button
+                  onClick={() => moveToLobbyFromSyncFailure('Returned to lobby.')}
+                  className="w-full px-6 py-4 bg-zinc-800 text-white rounded-2xl font-black italic"
+                >
+                  BACK TO LOBBY
+                </button>
               </div>
             </div>
           </div>

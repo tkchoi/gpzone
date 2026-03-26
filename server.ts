@@ -1001,6 +1001,12 @@ io.on("connection", (socket) => {
     initializeRoomGame(room);
   });
 
+  socket.on("request-game-state", (code: string) => {
+    const room = rooms[code];
+    if (!room || room.status !== "playing" || !room.players[socket.id]) return;
+    io.to(socket.id).emit("game-state", buildSnapshotForSocket(room, socket.id));
+  });
+
   socket.on("player-input", (data: { roomCode: string; input: InputState }) => {
     const room = rooms[data.roomCode];
     if (!room || room.status !== "playing" || !room.inputs[socket.id]) return;
