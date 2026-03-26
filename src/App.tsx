@@ -37,6 +37,11 @@ type MultiplayerSnapshot = {
   roundId: number;
 };
 
+type RemoteSnapshotSample = {
+  serverTime: number;
+  entity: Entity;
+};
+
 // Hashima Island (Gunkanjima) style ruined concrete map
 const INITIAL_WALLS: Wall[] = [
   // Outer boundaries
@@ -102,6 +107,18 @@ export default function App() {
   const lastAttackTimesRef = useRef<Record<string, number>>({});
   const attackFxTimesRef = useRef<Record<string, number>>({});
   const remotePlayerTargetsRef = useRef<Record<string, Entity>>({});
+  const remoteHistoryRef = useRef<Record<string, RemoteSnapshotSample[]>>({});
+  const allyTargetsRef = useRef<Record<string, Entity>>({});
+  const enemyTargetsRef = useRef<Record<string, Entity>>({});
+  const allyHistoryRef = useRef<Record<string, RemoteSnapshotSample[]>>({});
+  const enemyHistoryRef = useRef<Record<string, RemoteSnapshotSample[]>>({});
+  const networkTimingRef = useRef({
+    smoothedDelayMs: 80,
+    jitterMs: 0,
+    interpolationDelayMs: 110,
+    lastServerTime: 0,
+    lastLocalReceiveTime: 0,
+  });
 
   const isPlayingRef = useRef(false);
   const isPausedRef = useRef(false);
@@ -113,6 +130,8 @@ export default function App() {
   const SINGLE_TIME_STEP = 1000 / 60;
   const MULTI_TIME_STEP = 1000 / 30;
   const MULTI_SPEED = 10;
+
+  const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
   const createEmptyPlayer = (): Entity => ({
     id: 'player',
@@ -239,6 +258,18 @@ export default function App() {
     lastAttackTimesRef.current = {};
     attackFxTimesRef.current = {};
     remotePlayerTargetsRef.current = {};
+    remoteHistoryRef.current = {};
+    allyTargetsRef.current = {};
+    enemyTargetsRef.current = {};
+    allyHistoryRef.current = {};
+    enemyHistoryRef.current = {};
+    networkTimingRef.current = {
+      smoothedDelayMs: 80,
+      jitterMs: 0,
+      interpolationDelayMs: 110,
+      lastServerTime: 0,
+      lastLocalReceiveTime: 0,
+    };
     cameraRef.current = { x: 0, y: 0 };
     multiInputRef.current = { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
     multiOutcomeRef.current = { gameOver: false, gameWon: false };
@@ -252,6 +283,15 @@ export default function App() {
     const socketId = socketRef.current?.id;
     if (!socketId) return;
     if (snapshot.roundId < roundIdRef.current) return;
+    const localReceiveTime = Date.now();
+    const observedDelay = Math.max(0, localReceiveTime - snapshot.serverTime);
+    const timing = networkTimingRef.current;
+    const delayDiff = observedDelay - timing.smoothedDelayMs;
+    timing.smoothedDelayMs += delayDiff * 0.1;
+    timing.jitterMs += (Math.abs(delayDiff) - timing.jitterMs) * 0.1;
+    timing.interpolationDelayMs = clamp(timing.smoothedDelayMs + timing.jitterMs * 2 + 30, 70, 220);
+    timing.lastServerTime = snapshot.serverTime;
+    timing.lastLocalReceiveTime = localReceiveTime;
     setMultiState(prev => ({ ...prev, matchType: snapshot.matchType }));
     if (snapshot.roundId !== roundIdRef.current) {
       roundIdRef.current = snapshot.roundId;
@@ -260,6 +300,11 @@ export default function App() {
       lastHitTimesRef.current = {};
       lastAttackTimesRef.current = {};
       attackFxTimesRef.current = {};
+      remoteHistoryRef.current = {};
+      allyTargetsRef.current = {};
+      enemyTargetsRef.current = {};
+      allyHistoryRef.current = {};
+      enemyHistoryRef.current = {};
       multiInputRef.current = {
         seq: 0,
         roundId: snapshot.roundId,
@@ -345,8 +390,75 @@ export default function App() {
         }])
     );
     remotePlayerTargetsRef.current = authoritativeRemotePlayers;
+    const remoteHistory = remoteHistoryRef.current;
+    const activeRemoteIds = new Set(Object.keys(authoritativeRemotePlayers));
+    for (const [id, player] of Object.entries(authoritativeRemotePlayers)) {
+      const history = remoteHistory[id] ?? [];
+      history.push({
+        serverTime: snapshot.serverTime,
+        entity: {
+          ...player,
+          pos: { ...player.pos },
+          pushVelocity: { ...player.pushVelocity },
+        },
+      });
+      while (history.length > 40) history.shift();
+      while (history.length > 2 && history[0].serverTime < snapshot.serverTime - 2000) history.shift();
+      remoteHistory[id] = history;
+    }
+    for (const id of Object.keys(remoteHistory)) {
+      if (!activeRemoteIds.has(id)) delete remoteHistory[id];
+    }
+
+    const authoritativeAllies: Record<string, Entity> = Object.fromEntries(
+      snapshot.allies.map((ally) => [
+        ally.id,
+        {
+          ...ally,
+          pos: { ...ally.pos },
+          pushVelocity: { ...ally.pushVelocity },
+        },
+      ]),
+    );
+    const authoritativeEnemies: Record<string, Entity> = Object.fromEntries(
+      snapshot.enemies.map((enemy) => [
+        enemy.id,
+        {
+          ...enemy,
+          pos: { ...enemy.pos },
+          pushVelocity: { ...enemy.pushVelocity },
+        },
+      ]),
+    );
+    allyTargetsRef.current = authoritativeAllies;
+    enemyTargetsRef.current = authoritativeEnemies;
+
+    const allyHistory = allyHistoryRef.current;
+    const enemyHistory = enemyHistoryRef.current;
+    for (const [id, ally] of Object.entries(authoritativeAllies)) {
+      const history = allyHistory[id] ?? [];
+      history.push({ serverTime: snapshot.serverTime, entity: ally });
+      while (history.length > 40) history.shift();
+      while (history.length > 2 && history[0].serverTime < snapshot.serverTime - 2000) history.shift();
+      allyHistory[id] = history;
+    }
+    for (const [id, enemy] of Object.entries(authoritativeEnemies)) {
+      const history = enemyHistory[id] ?? [];
+      history.push({ serverTime: snapshot.serverTime, entity: enemy });
+      while (history.length > 40) history.shift();
+      while (history.length > 2 && history[0].serverTime < snapshot.serverTime - 2000) history.shift();
+      enemyHistory[id] = history;
+    }
+    for (const id of Object.keys(allyHistory)) {
+      if (!authoritativeAllies[id]) delete allyHistory[id];
+    }
+    for (const id of Object.keys(enemyHistory)) {
+      if (!authoritativeEnemies[id]) delete enemyHistory[id];
+    }
 
     const currentDisplayedRemotes = gameStateRef.current?.remotePlayers ?? {};
+    const currentDisplayedAllies = Object.fromEntries((gameStateRef.current?.allies ?? []).map((ally) => [ally.id, ally]));
+    const currentDisplayedEnemies = Object.fromEntries((gameStateRef.current?.enemies ?? []).map((enemy) => [enemy.id, enemy]));
     const remoteTargets: Record<string, Entity> = {};
     for (const [id, authoritativeRemote] of Object.entries(authoritativeRemotePlayers)) {
       const currentRemote = currentDisplayedRemotes[id];
@@ -354,45 +466,33 @@ export default function App() {
         remoteTargets[id] = authoritativeRemote;
         continue;
       }
-
-      const dx = authoritativeRemote.pos.x - currentRemote.pos.x;
-      const dy = authoritativeRemote.pos.y - currentRemote.pos.y;
-      const dist = Math.hypot(dx, dy);
-      const positionLerp = dist > 320 ? 0.42 : 0.24;
-
-      const nextPos = dist > 760
-        ? { ...authoritativeRemote.pos }
-        : {
-            x: currentRemote.pos.x + dx * positionLerp,
-            y: currentRemote.pos.y + dy * positionLerp,
-          };
-
-      let facingDelta = authoritativeRemote.facingAngle - currentRemote.facingAngle;
-      while (facingDelta > Math.PI) facingDelta -= Math.PI * 2;
-      while (facingDelta < -Math.PI) facingDelta += Math.PI * 2;
-
       remoteTargets[id] = {
-        ...currentRemote,
         ...authoritativeRemote,
-        pos: nextPos,
-        facingAngle: Math.abs(facingDelta) < 0.01
-          ? authoritativeRemote.facingAngle
-          : currentRemote.facingAngle + facingDelta * 0.25,
+        pos: { ...currentRemote.pos },
+        facingAngle: currentRemote.facingAngle,
         pushVelocity: { ...authoritativeRemote.pushVelocity },
       };
     }
 
-    const nextAllies = snapshot.allies.map((ally) => ({
-      ...ally,
-      pos: { ...ally.pos },
-      pushVelocity: { ...ally.pushVelocity },
-    }));
+    const nextAllies = snapshot.allies.map((ally) => {
+      const currentAlly = currentDisplayedAllies[ally.id];
+      return {
+        ...ally,
+        pos: currentAlly ? { ...currentAlly.pos } : { ...ally.pos },
+        facingAngle: currentAlly ? currentAlly.facingAngle : ally.facingAngle,
+        pushVelocity: { ...ally.pushVelocity },
+      };
+    });
 
-    const nextEnemies = snapshot.enemies.map((enemy) => ({
-      ...enemy,
-      pos: { ...enemy.pos },
-      pushVelocity: { ...enemy.pushVelocity },
-    }));
+    const nextEnemies = snapshot.enemies.map((enemy) => {
+      const currentEnemy = currentDisplayedEnemies[enemy.id];
+      return {
+        ...enemy,
+        pos: currentEnemy ? { ...currentEnemy.pos } : { ...enemy.pos },
+        facingAngle: currentEnemy ? currentEnemy.facingAngle : enemy.facingAngle,
+        pushVelocity: { ...enemy.pushVelocity },
+      };
+    });
 
     const nextEntitiesForHitFx = [
       localPlayer,
@@ -466,8 +566,51 @@ export default function App() {
   const interpolateRemotePlayers = (state: GameState) => {
     const authoritativeRemotes = remotePlayerTargetsRef.current;
     const displayedRemotes = state.remotePlayers;
+    const timing = networkTimingRef.current;
+    const estimatedServerNow = timing.lastServerTime > 0
+      ? timing.lastServerTime + (Date.now() - timing.lastLocalReceiveTime)
+      : 0;
+    const renderServerTime = estimatedServerNow - timing.interpolationDelayMs;
 
     for (const [id, remote] of Object.entries(displayedRemotes)) {
+      const history = remoteHistoryRef.current[id];
+      if (history && history.length > 0 && renderServerTime > 0) {
+        let prev = history[0];
+        let next = history[history.length - 1];
+        for (let i = 0; i < history.length - 1; i++) {
+          const a = history[i];
+          const b = history[i + 1];
+          if (renderServerTime >= a.serverTime && renderServerTime <= b.serverTime) {
+            prev = a;
+            next = b;
+            break;
+          }
+          if (renderServerTime < history[0].serverTime) {
+            prev = history[0];
+            next = history[0];
+            break;
+          }
+        }
+
+        const span = Math.max(1, next.serverTime - prev.serverTime);
+        const t = clamp((renderServerTime - prev.serverTime) / span, 0, 1);
+        let facingDelta = next.entity.facingAngle - prev.entity.facingAngle;
+        while (facingDelta > Math.PI) facingDelta -= Math.PI * 2;
+        while (facingDelta < -Math.PI) facingDelta += Math.PI * 2;
+
+        displayedRemotes[id] = {
+          ...remote,
+          ...next.entity,
+          pos: {
+            x: prev.entity.pos.x + (next.entity.pos.x - prev.entity.pos.x) * t,
+            y: prev.entity.pos.y + (next.entity.pos.y - prev.entity.pos.y) * t,
+          },
+          facingAngle: prev.entity.facingAngle + facingDelta * t,
+          pushVelocity: { ...next.entity.pushVelocity },
+        };
+        continue;
+      }
+
       const target = authoritativeRemotes[id];
       if (!target) continue;
 
@@ -499,6 +642,91 @@ export default function App() {
     }
   };
 
+  const getRenderServerTime = () => {
+    const timing = networkTimingRef.current;
+    if (timing.lastServerTime <= 0) return 0;
+    const estimatedServerNow = timing.lastServerTime + (Date.now() - timing.lastLocalReceiveTime);
+    return estimatedServerNow - timing.interpolationDelayMs;
+  };
+
+  const interpolateNetworkUnits = (state: GameState) => {
+    const renderServerTime = getRenderServerTime();
+
+    const interpolateList = (
+      units: Entity[],
+      targetsById: Record<string, Entity>,
+      historiesById: Record<string, RemoteSnapshotSample[]>,
+    ) => {
+      for (let i = 0; i < units.length; i++) {
+        const unit = units[i];
+        const history = historiesById[unit.id];
+        if (history && history.length > 0 && renderServerTime > 0) {
+          let prev = history[0];
+          let next = history[history.length - 1];
+          for (let j = 0; j < history.length - 1; j++) {
+            const a = history[j];
+            const b = history[j + 1];
+            if (renderServerTime >= a.serverTime && renderServerTime <= b.serverTime) {
+              prev = a;
+              next = b;
+              break;
+            }
+            if (renderServerTime < history[0].serverTime) {
+              prev = history[0];
+              next = history[0];
+              break;
+            }
+          }
+
+          const span = Math.max(1, next.serverTime - prev.serverTime);
+          const t = clamp((renderServerTime - prev.serverTime) / span, 0, 1);
+          let facingDelta = next.entity.facingAngle - prev.entity.facingAngle;
+          while (facingDelta > Math.PI) facingDelta -= Math.PI * 2;
+          while (facingDelta < -Math.PI) facingDelta += Math.PI * 2;
+
+          units[i] = {
+            ...unit,
+            ...next.entity,
+            pos: {
+              x: prev.entity.pos.x + (next.entity.pos.x - prev.entity.pos.x) * t,
+              y: prev.entity.pos.y + (next.entity.pos.y - prev.entity.pos.y) * t,
+            },
+            facingAngle: prev.entity.facingAngle + facingDelta * t,
+            pushVelocity: { ...next.entity.pushVelocity },
+          };
+          continue;
+        }
+
+        const target = targetsById[unit.id];
+        if (!target) continue;
+        const dx = target.pos.x - unit.pos.x;
+        const dy = target.pos.y - unit.pos.y;
+        const dist = Math.hypot(dx, dy);
+        const lerp = dist > 260 ? 0.32 : 0.2;
+        const nextPos = dist > 760
+          ? { ...target.pos }
+          : { x: unit.pos.x + dx * lerp, y: unit.pos.y + dy * lerp };
+
+        let facingDelta = target.facingAngle - unit.facingAngle;
+        while (facingDelta > Math.PI) facingDelta -= Math.PI * 2;
+        while (facingDelta < -Math.PI) facingDelta += Math.PI * 2;
+
+        units[i] = {
+          ...unit,
+          ...target,
+          pos: nextPos,
+          facingAngle: Math.abs(facingDelta) < 0.01
+            ? target.facingAngle
+            : unit.facingAngle + facingDelta * 0.3,
+          pushVelocity: { ...target.pushVelocity },
+        };
+      }
+    };
+
+    interpolateList(state.allies, allyTargetsRef.current, allyHistoryRef.current);
+    interpolateList(state.enemies, enemyTargetsRef.current, enemyHistoryRef.current);
+  };
+
   const initGame = (mode: 'single' | 'multi' = 'single') => {
     keysPressed.current.clear();
     joystickRef.current = { x: 0, y: 0 };
@@ -509,6 +737,18 @@ export default function App() {
       inputSeqRef.current = 0;
       pendingInputsRef.current = [];
       remotePlayerTargetsRef.current = {};
+      remoteHistoryRef.current = {};
+      allyTargetsRef.current = {};
+      enemyTargetsRef.current = {};
+      allyHistoryRef.current = {};
+      enemyHistoryRef.current = {};
+      networkTimingRef.current = {
+        smoothedDelayMs: 80,
+        jitterMs: 0,
+        interpolationDelayMs: 110,
+        lastServerTime: 0,
+        lastLocalReceiveTime: 0,
+      };
       lastAttackTimesRef.current = {};
       attackFxTimesRef.current = {};
       multiInputRef.current = {
@@ -715,6 +955,18 @@ export default function App() {
     roundIdRef.current = 0;
     pendingInputsRef.current = [];
     remotePlayerTargetsRef.current = {};
+    remoteHistoryRef.current = {};
+    allyTargetsRef.current = {};
+    enemyTargetsRef.current = {};
+    allyHistoryRef.current = {};
+    enemyHistoryRef.current = {};
+    networkTimingRef.current = {
+      smoothedDelayMs: 80,
+      jitterMs: 0,
+      interpolationDelayMs: 110,
+      lastServerTime: 0,
+      lastLocalReceiveTime: 0,
+    };
     lastAttackTimesRef.current = {};
     attackFxTimesRef.current = {};
     multiInputRef.current = { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
@@ -1210,6 +1462,7 @@ export default function App() {
           predictMultiplayerStep();
           if (gameStateRef.current) {
             interpolateRemotePlayers(gameStateRef.current);
+            interpolateNetworkUnits(gameStateRef.current);
             updateVisualEffects(gameStateRef.current);
           }
         } else {
