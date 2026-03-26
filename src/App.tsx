@@ -494,10 +494,17 @@ export default function App() {
 
     if (mode === 'multi') {
       inputSeqRef.current = 0;
-      roundIdRef.current = 0;
       pendingInputsRef.current = [];
       remotePlayerTargetsRef.current = {};
-      multiInputRef.current = { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
+      multiInputRef.current = {
+        seq: 0,
+        roundId: roundIdRef.current,
+        clientTime: Date.now(),
+        moveX: 0,
+        moveY: 0,
+        attack: false,
+        skill: false,
+      };
       multiOutcomeRef.current = { gameOver: false, gameWon: false };
       setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
       setMultiScores({});
