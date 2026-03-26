@@ -99,6 +99,8 @@ export default function App() {
   const roundIdRef = useRef(0);
   const pendingInputsRef = useRef<MultiplayerInputState[]>([]);
   const lastHitTimesRef = useRef<Record<string, number>>({});
+  const lastAttackTimesRef = useRef<Record<string, number>>({});
+  const attackFxTimesRef = useRef<Record<string, number>>({});
   const remotePlayerTargetsRef = useRef<Record<string, Entity>>({});
 
   const isPlayingRef = useRef(false);
@@ -234,6 +236,8 @@ export default function App() {
     roundIdRef.current = 0;
     pendingInputsRef.current = [];
     lastHitTimesRef.current = {};
+    lastAttackTimesRef.current = {};
+    attackFxTimesRef.current = {};
     remotePlayerTargetsRef.current = {};
     cameraRef.current = { x: 0, y: 0 };
     multiInputRef.current = { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
@@ -254,6 +258,8 @@ export default function App() {
       inputSeqRef.current = 0;
       pendingInputsRef.current = [];
       lastHitTimesRef.current = {};
+      lastAttackTimesRef.current = {};
+      attackFxTimesRef.current = {};
       multiInputRef.current = {
         seq: 0,
         roundId: snapshot.roundId,
@@ -394,6 +400,7 @@ export default function App() {
       ...nextAllies,
       ...nextEnemies,
     ];
+    const nowLocal = Date.now() - totalPausedTimeRef.current;
 
     gameStateRef.current = {
       player: localPlayer,
@@ -426,6 +433,12 @@ export default function App() {
         );
       }
       lastHitTimesRef.current[entity.id] = entity.lastHitTime;
+
+      const previousLastAttackTime = lastAttackTimesRef.current[entity.id] ?? 0;
+      if (entity.lastAttackTime > previousLastAttackTime) {
+        attackFxTimesRef.current[entity.id] = nowLocal;
+      }
+      lastAttackTimesRef.current[entity.id] = entity.lastAttackTime;
     }
 
     const elapsed = Math.max(0, Date.now() - localPlayer.lastSkillTime);
@@ -496,6 +509,8 @@ export default function App() {
       inputSeqRef.current = 0;
       pendingInputsRef.current = [];
       remotePlayerTargetsRef.current = {};
+      lastAttackTimesRef.current = {};
+      attackFxTimesRef.current = {};
       multiInputRef.current = {
         seq: 0,
         roundId: roundIdRef.current,
@@ -700,6 +715,8 @@ export default function App() {
     roundIdRef.current = 0;
     pendingInputsRef.current = [];
     remotePlayerTargetsRef.current = {};
+    lastAttackTimesRef.current = {};
+    attackFxTimesRef.current = {};
     multiInputRef.current = { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
     multiOutcomeRef.current = { gameOver: false, gameWon: false };
     gameStateRef.current = null;
@@ -1419,9 +1436,12 @@ export default function App() {
 
     effectEntities.forEach(entity => {
       const isBoss = entity.type === PieceType.KING && entity.team === Team.RED;
-      const isLocalPlayer = entity.id === 'player';
+      const localAttackFxTime = attackFxTimesRef.current[entity.id];
+      const isRecentAttackFx = localAttackFxTime !== undefined
+        ? (now - localAttackFxTime < 180)
+        : (now - entity.lastAttackTime < 180);
 
-      if (now - entity.lastAttackTime < 180) {
+      if (isRecentAttackFx) {
         ctx.save();
         ctx.translate(entity.pos.x, entity.pos.y);
         ctx.rotate(entity.facingAngle);
