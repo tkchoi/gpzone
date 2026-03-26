@@ -1342,10 +1342,20 @@ export default function App() {
     if (!ctx) return;
 
     // Camera logic: center on player, clamp to map bounds
-    const targetCamX = Math.max(0, Math.min(Math.max(0, MAP_WIDTH - canvasSize.width), state.player.pos.x - canvasSize.width / 2));
-    const targetCamY = Math.max(0, Math.min(Math.max(0, MAP_HEIGHT - canvasSize.height), state.player.pos.y - canvasSize.height / 2));
+    // Use the actual canvas dimensions to avoid viewport/state mismatch on mobile.
+    const viewWidth = canvas.width;
+    const viewHeight = canvas.height;
+    const maxCamX = Math.max(0, MAP_WIDTH - viewWidth);
+    const maxCamY = Math.max(0, MAP_HEIGHT - viewHeight);
+    const clampCam = (value: number, max: number) => Math.max(0, Math.min(max, value));
+    const targetCamX = clampCam(state.player.pos.x - viewWidth / 2, maxCamX);
+    const targetCamY = clampCam(state.player.pos.y - viewHeight / 2, maxCamY);
     const currentCam = cameraRef.current;
     const smoothing = gameModeRef.current === 'multi' ? 0.18 : 0.35;
+
+    // Clamp stale camera values first (e.g. after retry or mobile viewport changes).
+    currentCam.x = clampCam(currentCam.x, maxCamX);
+    currentCam.y = clampCam(currentCam.y, maxCamY);
 
     currentCam.x += (targetCamX - currentCam.x) * smoothing;
     currentCam.y += (targetCamY - currentCam.y) * smoothing;
@@ -1353,8 +1363,8 @@ export default function App() {
     if (Math.abs(targetCamX - currentCam.x) < 0.5) currentCam.x = targetCamX;
     if (Math.abs(targetCamY - currentCam.y) < 0.5) currentCam.y = targetCamY;
 
-    const camX = currentCam.x;
-    const camY = currentCam.y;
+    const camX = clampCam(currentCam.x, maxCamX);
+    const camY = clampCam(currentCam.y, maxCamY);
 
     ctx.save();
     
@@ -1367,7 +1377,7 @@ export default function App() {
 
     // Background (Ocean/Abyss outside map)
     ctx.fillStyle = '#050505';
-    ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
+    ctx.fillRect(0, 0, viewWidth, viewHeight);
 
     // Apply Camera Transform
     ctx.translate(-camX, -camY);
