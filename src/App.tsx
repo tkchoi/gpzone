@@ -566,58 +566,15 @@ export default function App() {
   const interpolateRemotePlayers = (state: GameState) => {
     const authoritativeRemotes = remotePlayerTargetsRef.current;
     const displayedRemotes = state.remotePlayers;
-    const timing = networkTimingRef.current;
-    const estimatedServerNow = timing.lastServerTime > 0
-      ? timing.lastServerTime + (Date.now() - timing.lastLocalReceiveTime)
-      : 0;
-    const renderServerTime = estimatedServerNow - timing.interpolationDelayMs;
 
     for (const [id, remote] of Object.entries(displayedRemotes)) {
-      const history = remoteHistoryRef.current[id];
-      if (history && history.length > 0 && renderServerTime > 0) {
-        let prev = history[0];
-        let next = history[history.length - 1];
-        for (let i = 0; i < history.length - 1; i++) {
-          const a = history[i];
-          const b = history[i + 1];
-          if (renderServerTime >= a.serverTime && renderServerTime <= b.serverTime) {
-            prev = a;
-            next = b;
-            break;
-          }
-          if (renderServerTime < history[0].serverTime) {
-            prev = history[0];
-            next = history[0];
-            break;
-          }
-        }
-
-        const span = Math.max(1, next.serverTime - prev.serverTime);
-        const t = clamp((renderServerTime - prev.serverTime) / span, 0, 1);
-        let facingDelta = next.entity.facingAngle - prev.entity.facingAngle;
-        while (facingDelta > Math.PI) facingDelta -= Math.PI * 2;
-        while (facingDelta < -Math.PI) facingDelta += Math.PI * 2;
-
-        displayedRemotes[id] = {
-          ...remote,
-          ...next.entity,
-          pos: {
-            x: prev.entity.pos.x + (next.entity.pos.x - prev.entity.pos.x) * t,
-            y: prev.entity.pos.y + (next.entity.pos.y - prev.entity.pos.y) * t,
-          },
-          facingAngle: prev.entity.facingAngle + facingDelta * t,
-          pushVelocity: { ...next.entity.pushVelocity },
-        };
-        continue;
-      }
-
       const target = authoritativeRemotes[id];
       if (!target) continue;
 
       const dx = target.pos.x - remote.pos.x;
       const dy = target.pos.y - remote.pos.y;
       const dist = Math.hypot(dx, dy);
-      const lerp = dist > 260 ? 0.32 : 0.2;
+      const lerp = dist > 260 ? 0.24 : 0.14;
 
       const nextPos = dist > 760
         ? { ...target.pos }
@@ -642,67 +599,19 @@ export default function App() {
     }
   };
 
-  const getRenderServerTime = () => {
-    const timing = networkTimingRef.current;
-    if (timing.lastServerTime <= 0) return 0;
-    const estimatedServerNow = timing.lastServerTime + (Date.now() - timing.lastLocalReceiveTime);
-    return estimatedServerNow - timing.interpolationDelayMs;
-  };
-
   const interpolateNetworkUnits = (state: GameState) => {
-    const renderServerTime = getRenderServerTime();
-
     const interpolateList = (
       units: Entity[],
       targetsById: Record<string, Entity>,
-      historiesById: Record<string, RemoteSnapshotSample[]>,
     ) => {
       for (let i = 0; i < units.length; i++) {
         const unit = units[i];
-        const history = historiesById[unit.id];
-        if (history && history.length > 0 && renderServerTime > 0) {
-          let prev = history[0];
-          let next = history[history.length - 1];
-          for (let j = 0; j < history.length - 1; j++) {
-            const a = history[j];
-            const b = history[j + 1];
-            if (renderServerTime >= a.serverTime && renderServerTime <= b.serverTime) {
-              prev = a;
-              next = b;
-              break;
-            }
-            if (renderServerTime < history[0].serverTime) {
-              prev = history[0];
-              next = history[0];
-              break;
-            }
-          }
-
-          const span = Math.max(1, next.serverTime - prev.serverTime);
-          const t = clamp((renderServerTime - prev.serverTime) / span, 0, 1);
-          let facingDelta = next.entity.facingAngle - prev.entity.facingAngle;
-          while (facingDelta > Math.PI) facingDelta -= Math.PI * 2;
-          while (facingDelta < -Math.PI) facingDelta += Math.PI * 2;
-
-          units[i] = {
-            ...unit,
-            ...next.entity,
-            pos: {
-              x: prev.entity.pos.x + (next.entity.pos.x - prev.entity.pos.x) * t,
-              y: prev.entity.pos.y + (next.entity.pos.y - prev.entity.pos.y) * t,
-            },
-            facingAngle: prev.entity.facingAngle + facingDelta * t,
-            pushVelocity: { ...next.entity.pushVelocity },
-          };
-          continue;
-        }
-
         const target = targetsById[unit.id];
         if (!target) continue;
         const dx = target.pos.x - unit.pos.x;
         const dy = target.pos.y - unit.pos.y;
         const dist = Math.hypot(dx, dy);
-        const lerp = dist > 260 ? 0.32 : 0.2;
+        const lerp = dist > 260 ? 0.24 : 0.14;
         const nextPos = dist > 760
           ? { ...target.pos }
           : { x: unit.pos.x + dx * lerp, y: unit.pos.y + dy * lerp };
@@ -723,8 +632,8 @@ export default function App() {
       }
     };
 
-    interpolateList(state.allies, allyTargetsRef.current, allyHistoryRef.current);
-    interpolateList(state.enemies, enemyTargetsRef.current, enemyHistoryRef.current);
+    interpolateList(state.allies, allyTargetsRef.current);
+    interpolateList(state.enemies, enemyTargetsRef.current);
   };
 
   const initGame = (mode: 'single' | 'multi' = 'single') => {
