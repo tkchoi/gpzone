@@ -86,13 +86,14 @@ export default function App() {
   const [multiState, setMultiState] = useState<{
     roomCode: string;
     isHost: boolean;
-    players: { id: string; color: string }[];
+    players: { id: string; color: string; name?: string }[];
     status: 'lobby' | 'playing' | 'gameover';
     matchType: 'coop' | 'versus';
     error: string;
   }>({ roomCode: '', isHost: false, players: [], status: 'lobby', matchType: 'versus', error: '' });
   const [multiScores, setMultiScores] = useState<Record<string, number>>({});
   const [joinCode, setJoinCode] = useState('');
+  const [playerNameInput, setPlayerNameInput] = useState('');
   const [copied, setCopied] = useState(false);
   const [syncRecovery, setSyncRecovery] = useState({ active: false, retrying: false, message: '' });
   const socketRef = useRef<Socket | null>(null);
@@ -347,6 +348,7 @@ export default function App() {
           team: replayedPlayer.team,
           color: replayedPlayer.color,
           baseColor: replayedPlayer.baseColor,
+          name: replayedPlayer.name,
           playerIndex: replayedPlayer.playerIndex,
           lastAttackTime: replayedPlayer.lastAttackTime,
           lastSkillTime: replayedPlayer.lastSkillTime,
@@ -818,7 +820,7 @@ export default function App() {
       return;
     }
     setMultiState(prev => ({ ...prev, error: '' }));
-    socketRef.current?.emit('create-room', { matchType: 'versus' });
+    socketRef.current?.emit('create-room', { matchType: 'versus', playerName: playerNameInput.trim() });
   };
 
   const normalizeJoinCode = (value: string) => {
@@ -854,7 +856,7 @@ export default function App() {
       }
       setMultiState(prev => ({ ...prev, error: '' }));
       setJoinCode(normalizedCode);
-      socketRef.current?.emit('join-room', normalizedCode);
+      socketRef.current?.emit('join-room', { code: normalizedCode, playerName: playerNameInput.trim() });
     }
   };
 
@@ -1534,10 +1536,11 @@ export default function App() {
       ctx.fillStyle = '#ffffff';
       ctx.font = 'bold 12px sans-serif';
       ctx.textAlign = 'center';
-      const label = entity.playerIndex !== undefined 
-        ? `PLAYER ${entity.playerIndex + 1}${isLocalPlayer ? ' (YOU)' : ''}`
-        : (isLocalPlayer ? 'YOU' : 'PLAYER');
-      ctx.fillText(label, 0, -height - entity.radius - 5);
+      const baseLabel = entity.name?.trim()
+        ? entity.name.trim()
+        : (entity.playerIndex !== undefined ? `PLAYER ${entity.playerIndex + 1}` : 'PLAYER');
+      const label = `${baseLabel}${isLocalPlayer ? ' (YOU)' : ''}`;
+      ctx.fillText(label, 0, entity.radius * 2.1);
     }
 
     // Visor/Face
@@ -2139,10 +2142,17 @@ export default function App() {
                       </div>
                     </button>
 
-                    <div className="flex flex-col gap-2">
-                      <div className="relative">
-                        <input 
-                          type="text" 
+	                    <div className="flex flex-col gap-2">
+	                      <input 
+	                        type="text"
+	                        placeholder="PLAYER NAME (OPTIONAL)"
+	                        value={playerNameInput}
+	                        onChange={(e) => setPlayerNameInput(e.target.value)}
+	                        className="w-full p-4 bg-zinc-900 border-2 border-zinc-800 rounded-2xl text-white font-black italic focus:border-blue-500 outline-none transition-all placeholder:text-zinc-700"
+	                      />
+	                      <div className="relative">
+	                        <input 
+	                          type="text" 
                           placeholder="ENTER ROOM CODE OR INVITE LINK"
                           value={joinCode}
                           onChange={(e) => setJoinCode(e.target.value)}
@@ -2170,12 +2180,12 @@ export default function App() {
                     <div className="w-full p-6 bg-zinc-900 border-2 border-zinc-800 rounded-3xl flex flex-col items-center gap-4">
                       <span className="text-zinc-500 font-black uppercase text-[10px] tracking-widest">Connected Players</span>
                       <div className="flex flex-wrap justify-center gap-2">
-                        {multiState.players.map((p, idx) => (
-                          <div key={p.id} className="flex items-center gap-2 px-4 py-2 bg-zinc-800 rounded-xl border border-zinc-700 text-white font-black italic text-sm">
-                            <div className="w-2 h-2 rounded-full" style={{ backgroundColor: p.color }} />
-                            PLAYER {idx + 1} {p.id === socketRef.current?.id ? '(YOU)' : ''}
-                          </div>
-                        ))}
+	                        {multiState.players.map((p, idx) => (
+	                          <div key={p.id} className="flex items-center gap-2 px-4 py-2 bg-zinc-800 rounded-xl border border-zinc-700 text-white font-black italic text-sm">
+	                            <div className="w-2 h-2 rounded-full" style={{ backgroundColor: p.color }} />
+	                            {(p.name?.trim() || `PLAYER ${idx + 1}`)} {p.id === socketRef.current?.id ? '(YOU)' : ''}
+	                          </div>
+	                        ))}
                       </div>                    </div>
 
                     <div className="flex gap-2 w-full">
@@ -2447,17 +2457,18 @@ export default function App() {
               
       <div className="flex flex-col gap-4 w-full max-w-2xl mb-12">
                 {gameMode === 'multi' && (multiState.status === 'playing' || uiState.gameOver || uiState.gameWon) ? (
-                  multiState.players.map((p, idx) => {
-                    const isLocal = p.id === socketRef.current?.id;
-                    const playerScore = multiScores[p.id] || 0;
-                    return (
-                      <div key={p.id} className={`flex items-center justify-between p-6 rounded-2xl border ${isLocal ? 'bg-blue-500/10 border-blue-500/30' : 'bg-white/5 border-white/10'}`}>
-                        <div className="flex items-center gap-4">
-                          <div className="w-4 h-4 rounded-full" style={{ backgroundColor: p.color }} />
-                          <span className="text-xl font-black italic text-white uppercase tracking-tight">
-                            PLAYER {idx + 1} {isLocal ? '(YOU)' : ''}
-                          </span>
-                        </div>
+	                  multiState.players.map((p, idx) => {
+	                    const isLocal = p.id === socketRef.current?.id;
+	                    const playerScore = multiScores[p.id] || 0;
+	                    const displayName = p.name?.trim() || `PLAYER ${idx + 1}`;
+	                    return (
+	                      <div key={p.id} className={`flex items-center justify-between p-6 rounded-2xl border ${isLocal ? 'bg-blue-500/10 border-blue-500/30' : 'bg-white/5 border-white/10'}`}>
+	                        <div className="flex items-center gap-4">
+	                          <div className="w-4 h-4 rounded-full" style={{ backgroundColor: p.color }} />
+	                          <span className="text-xl font-black italic text-white uppercase tracking-tight">
+	                            {displayName} {isLocal ? '(YOU)' : ''}
+	                          </span>
+	                        </div>
                         <div className="text-3xl font-black italic text-white">
                           {playerScore.toLocaleString()}
                         </div>

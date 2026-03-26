@@ -96,6 +96,7 @@ type Entity = {
   color?: string;
   baseColor?: string;
   playerIndex?: number;
+  name?: string;
 };
 
 type InputState = {
@@ -159,7 +160,14 @@ function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
 }
 
-function createPlayer(socketId: string, index: number, total: number, matchType: "coop" | "versus"): Entity {
+function sanitizePlayerName(name?: string): string | undefined {
+  if (!name) return undefined;
+  const trimmed = name.trim();
+  if (!trimmed) return undefined;
+  return trimmed.slice(0, 18);
+}
+
+function createPlayer(socketId: string, index: number, total: number, matchType: "coop" | "versus", name?: string): Entity {
   const spawnPoints = [
     { x: MAP_WIDTH / 2, y: MAP_HEIGHT - 220, facingAngle: -Math.PI / 2 },
     { x: MAP_WIDTH / 2, y: 220, facingAngle: Math.PI / 2 },
@@ -204,6 +212,7 @@ function createPlayer(socketId: string, index: number, total: number, matchType:
     color: colorData.top,
     baseColor: colorData.base,
     playerIndex: index,
+    name: sanitizePlayerName(name),
   };
 }
 
@@ -774,7 +783,7 @@ function emitGameState(room: RoomState) {
 function emitRoomUpdate(room: RoomState) {
   io.to(room.code).emit("room-update", {
     code: room.code,
-    players: Object.entries(room.players).map(([id, p]) => ({ id, color: p.color })),
+    players: Object.entries(room.players).map(([id, p]) => ({ id, color: p.color, name: p.name })),
     hostId: room.hostId,
     status: room.status,
     matchType: room.matchType,
@@ -858,8 +867,9 @@ function initializeRoomGame(room: RoomState) {
 
   const otherPlayerIds = Object.keys(room.players).filter((id) => id !== room.hostId);
   const sortedPlayerIds = [room.hostId, ...otherPlayerIds];
+  const existingNames = Object.fromEntries(Object.entries(room.players).map(([id, player]) => [id, player.name]));
   room.players = Object.fromEntries(
-    sortedPlayerIds.map((id, index) => [id, createPlayer(id, index, sortedPlayerIds.length, room.matchType)]),
+    sortedPlayerIds.map((id, index) => [id, createPlayer(id, index, sortedPlayerIds.length, room.matchType, existingNames[id])]),
   );
   room.inputs = Object.fromEntries(
     sortedPlayerIds.map((id) => [
@@ -932,24 +942,31 @@ function detachSocketFromRooms(socketId: string) {
 }
 
 io.on("connection", (socket) => {
-  socket.on("create-room", (payload?: { matchType?: "coop" | "versus" }) => {
+  socket.on("create-room", (payload?: { matchType?: "coop" | "versus"; playerName?: string }) => {
     for (const room of socket.rooms) {
       if (rooms[room]) socket.leave(room);
     }
     detachSocketFromRooms(socket.id);
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
     const room = createRoom(code, socket.id, payload?.matchType === "versus" ? "versus" : "coop");
+    room.players[socket.id].name = sanitizePlayerName(payload?.playerName);
     rooms[code] = room;
     socket.join(code);
     socket.emit("room-created", code);
     emitRoomUpdate(room);
   });
 
-  socket.on("join-room", (code: string) => {
+  socket.on("join-room", (payload: string | { code: string; playerName?: string }) => {
     for (const roomName of socket.rooms) {
       if (rooms[roomName]) socket.leave(roomName);
     }
     detachSocketFromRooms(socket.id);
+    const code = typeof payload === "string" ? payload : payload.code;
+    const playerName = typeof payload === "string" ? undefined : payload.playerName;
+    if (!code || typeof code !== "string") {
+      socket.emit("error-message", "Room code required");
+      return;
+    }
     const upperCode = code.toUpperCase();
     const room = rooms[upperCode];
 
@@ -968,6 +985,7 @@ io.on("connection", (socket) => {
       Object.keys(room.players).length,
       Object.keys(room.players).length + 1,
       room.matchType,
+      playerName,
     );
     room.playerScores[socket.id] = 0;
     room.inputs[socket.id] = { seq: 0, roundId: room.roundId, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };

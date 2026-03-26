@@ -70,6 +70,7 @@ export interface Entity {
   color?: string;
   baseColor?: string;
   playerIndex?: number;
+  name?: string;
 }
 
 export interface Particle {
