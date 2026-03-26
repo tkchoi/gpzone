@@ -98,6 +98,7 @@ export default function App() {
   const roundIdRef = useRef(0);
   const pendingInputsRef = useRef<MultiplayerInputState[]>([]);
   const lastHitTimesRef = useRef<Record<string, number>>({});
+  const remotePlayerTargetsRef = useRef<Record<string, Entity>>({});
 
   const isPlayingRef = useRef(false);
   const isPausedRef = useRef(false);
@@ -231,6 +232,7 @@ export default function App() {
     roundIdRef.current = 0;
     pendingInputsRef.current = [];
     lastHitTimesRef.current = {};
+    remotePlayerTargetsRef.current = {};
     cameraRef.current = { x: 0, y: 0 };
     multiInputRef.current = { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
     multiOutcomeRef.current = { gameOver: false, gameWon: false };
@@ -324,11 +326,53 @@ export default function App() {
         : currentDisplayedPlayer.facingAngle + facingDelta * 0.2;
     }
 
-    const remoteTargets: Record<string, Entity> = Object.fromEntries(
+    const authoritativeRemotePlayers: Record<string, Entity> = Object.fromEntries(
       (Object.entries(snapshot.players) as [string, Entity][])
         .filter(([id]) => id !== socketId)
-        .map(([id, player]) => [id, { ...player, id: `remote-${id}` }])
+        .map(([id, player]) => [id, {
+          ...player,
+          id: `remote-${id}`,
+          pos: { ...player.pos },
+          pushVelocity: { ...player.pushVelocity },
+        }])
     );
+    remotePlayerTargetsRef.current = authoritativeRemotePlayers;
+
+    const currentDisplayedRemotes = gameStateRef.current?.remotePlayers ?? {};
+    const remoteTargets: Record<string, Entity> = {};
+    for (const [id, authoritativeRemote] of Object.entries(authoritativeRemotePlayers)) {
+      const currentRemote = currentDisplayedRemotes[id];
+      if (!currentRemote) {
+        remoteTargets[id] = authoritativeRemote;
+        continue;
+      }
+
+      const dx = authoritativeRemote.pos.x - currentRemote.pos.x;
+      const dy = authoritativeRemote.pos.y - currentRemote.pos.y;
+      const dist = Math.hypot(dx, dy);
+      const positionLerp = dist > 320 ? 0.42 : 0.24;
+
+      const nextPos = dist > 760
+        ? { ...authoritativeRemote.pos }
+        : {
+            x: currentRemote.pos.x + dx * positionLerp,
+            y: currentRemote.pos.y + dy * positionLerp,
+          };
+
+      let facingDelta = authoritativeRemote.facingAngle - currentRemote.facingAngle;
+      while (facingDelta > Math.PI) facingDelta -= Math.PI * 2;
+      while (facingDelta < -Math.PI) facingDelta += Math.PI * 2;
+
+      remoteTargets[id] = {
+        ...currentRemote,
+        ...authoritativeRemote,
+        pos: nextPos,
+        facingAngle: Math.abs(facingDelta) < 0.01
+          ? authoritativeRemote.facingAngle
+          : currentRemote.facingAngle + facingDelta * 0.25,
+        pushVelocity: { ...authoritativeRemote.pushVelocity },
+      };
+    }
 
     const nextAllies = snapshot.allies.map((ally) => ({
       ...ally,
@@ -404,6 +448,42 @@ export default function App() {
     });
   };
 
+  const interpolateRemotePlayers = (state: GameState) => {
+    const authoritativeRemotes = remotePlayerTargetsRef.current;
+    const displayedRemotes = state.remotePlayers;
+
+    for (const [id, remote] of Object.entries(displayedRemotes)) {
+      const target = authoritativeRemotes[id];
+      if (!target) continue;
+
+      const dx = target.pos.x - remote.pos.x;
+      const dy = target.pos.y - remote.pos.y;
+      const dist = Math.hypot(dx, dy);
+      const lerp = dist > 260 ? 0.32 : 0.2;
+
+      const nextPos = dist > 760
+        ? { ...target.pos }
+        : {
+            x: remote.pos.x + dx * lerp,
+            y: remote.pos.y + dy * lerp,
+          };
+
+      let facingDelta = target.facingAngle - remote.facingAngle;
+      while (facingDelta > Math.PI) facingDelta -= Math.PI * 2;
+      while (facingDelta < -Math.PI) facingDelta += Math.PI * 2;
+
+      displayedRemotes[id] = {
+        ...remote,
+        ...target,
+        pos: nextPos,
+        facingAngle: Math.abs(facingDelta) < 0.01
+          ? target.facingAngle
+          : remote.facingAngle + facingDelta * 0.3,
+        pushVelocity: { ...target.pushVelocity },
+      };
+    }
+  };
+
   const initGame = (mode: 'single' | 'multi' = 'single') => {
     keysPressed.current.clear();
     joystickRef.current = { x: 0, y: 0 };
@@ -413,6 +493,7 @@ export default function App() {
       inputSeqRef.current = 0;
       roundIdRef.current = 0;
       pendingInputsRef.current = [];
+      remotePlayerTargetsRef.current = {};
       multiInputRef.current = { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
       multiOutcomeRef.current = { gameOver: false, gameWon: false };
       setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
@@ -608,6 +689,7 @@ export default function App() {
     inputSeqRef.current = 0;
     roundIdRef.current = 0;
     pendingInputsRef.current = [];
+    remotePlayerTargetsRef.current = {};
     multiInputRef.current = { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
     multiOutcomeRef.current = { gameOver: false, gameWon: false };
     gameStateRef.current = null;
@@ -1098,6 +1180,7 @@ export default function App() {
         if (gameModeRef.current === 'multi') {
           predictMultiplayerStep();
           if (gameStateRef.current) {
+            interpolateRemotePlayers(gameStateRef.current);
             updateVisualEffects(gameStateRef.current);
           }
         } else {
