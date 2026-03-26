@@ -87,8 +87,10 @@ export default function App() {
   const roomCodeRef = useRef('');
   const pendingAutoJoinRef = useRef('');
   const inputSeqRef = useRef(0);
-  const serverPlayerRef = useRef<Entity | null>(null);
   const serverRemotePlayersRef = useRef<Record<string, Entity>>({});
+  const serverAlliesRef = useRef<Record<string, Entity>>({});
+  const serverEnemiesRef = useRef<Record<string, Entity>>({});
+  const pendingInputsRef = useRef<MultiplayerInputState[]>([]);
 
   const isPlayingRef = useRef(false);
   const isPausedRef = useRef(false);
@@ -159,68 +161,55 @@ export default function App() {
 
   const reconcileMultiplayerState = () => {
     const state = gameStateRef.current;
-    const serverPlayer = serverPlayerRef.current;
-    if (!state || !serverPlayer) return;
+    if (!state) return;
 
-    const player = state.player;
-    const playerDx = serverPlayer.pos.x - player.pos.x;
-    const playerDy = serverPlayer.pos.y - player.pos.y;
-    const playerDist = Math.hypot(playerDx, playerDy);
+    const smoothEntityCollection = (currentEntities: Record<string, Entity>, targetEntities: Record<string, Entity>) => {
+      const nextEntities: Record<string, Entity> = {};
 
-    if (playerDist > 140) {
-      player.pos = { ...serverPlayer.pos };
-    } else if (playerDist > 2) {
-      const correction = playerDist > 48 ? 0.28 : 0.14;
-      player.pos.x += playerDx * correction;
-      player.pos.y += playerDy * correction;
-    }
+      for (const [id, target] of Object.entries(targetEntities) as [string, Entity][]) {
+        const current = currentEntities[id];
 
-    const playerAngleDelta = normalizeAngleDelta(serverPlayer.facingAngle - player.facingAngle);
-    player.facingAngle += playerAngleDelta * 0.2;
-    player.hp = serverPlayer.hp;
-    player.maxHp = serverPlayer.maxHp;
-    player.isDead = serverPlayer.isDead;
-    player.lastAttackTime = serverPlayer.lastAttackTime;
-    player.lastSkillTime = serverPlayer.lastSkillTime;
-    player.lastHitTime = serverPlayer.lastHitTime;
-    player.pushVelocity = { ...serverPlayer.pushVelocity };
-    player.lastProcessedInputSeq = serverPlayer.lastProcessedInputSeq;
+        if (!current) {
+          nextEntities[id] = { ...target };
+          continue;
+        }
 
-    const nextRemotePlayers: Record<string, Entity> = {};
+        const dx = target.pos.x - current.pos.x;
+        const dy = target.pos.y - current.pos.y;
+        const dist = Math.hypot(dx, dy);
+        let pos = current.pos;
 
-    for (const [id, target] of Object.entries(serverRemotePlayersRef.current) as [string, Entity][]) {
-      const current = state.remotePlayers[id];
+        if (dist > 220) {
+          pos = { ...target.pos };
+        } else if (dist > 0.5) {
+          const step = Math.min(22, Math.max(4, dist * 0.4));
+          const ratio = Math.min(1, step / dist);
+          pos = {
+            x: current.pos.x + dx * ratio,
+            y: current.pos.y + dy * ratio,
+          };
+        }
 
-      if (!current) {
-        nextRemotePlayers[id] = { ...target };
-        continue;
-      }
-
-      const dx = target.pos.x - current.pos.x;
-      const dy = target.pos.y - current.pos.y;
-      const dist = Math.hypot(dx, dy);
-      let pos = current.pos;
-
-      if (dist > 180) {
-        pos = { ...target.pos };
-      } else if (dist > 0.75) {
-        const step = Math.min(18, Math.max(3, dist * 0.35));
-        const ratio = Math.min(1, step / dist);
-        pos = {
-          x: current.pos.x + dx * ratio,
-          y: current.pos.y + dy * ratio,
+        const angleDelta = normalizeAngleDelta(target.facingAngle - current.facingAngle);
+        nextEntities[id] = {
+          ...target,
+          pos,
+          facingAngle: current.facingAngle + angleDelta * 0.35,
         };
       }
 
-      const angleDelta = normalizeAngleDelta(target.facingAngle - current.facingAngle);
-      nextRemotePlayers[id] = {
-        ...target,
-        pos,
-        facingAngle: current.facingAngle + angleDelta * 0.3,
-      };
-    }
+      return nextEntities;
+    };
 
-    state.remotePlayers = nextRemotePlayers;
+    state.remotePlayers = smoothEntityCollection(state.remotePlayers, serverRemotePlayersRef.current);
+    state.allies = Object.values(smoothEntityCollection(
+      Object.fromEntries(state.allies.map((entity) => [entity.id, entity])),
+      serverAlliesRef.current
+    ));
+    state.enemies = Object.values(smoothEntityCollection(
+      Object.fromEntries(state.enemies.map((entity) => [entity.id, entity])),
+      serverEnemiesRef.current
+    ));
   };
 
   const syncMultiInput = (patch: Partial<MultiplayerInputState> = {}) => {
@@ -234,6 +223,10 @@ export default function App() {
     multiInputRef.current = nextInput;
 
     if (gameModeRef.current === 'multi' && roomCodeRef.current) {
+      pendingInputsRef.current.push(nextInput);
+      if (pendingInputsRef.current.length > 120) {
+        pendingInputsRef.current = pendingInputsRef.current.slice(-120);
+      }
       socketRef.current?.emit('player-input', {
         roomCode: roomCodeRef.current,
         input: nextInput
@@ -261,8 +254,10 @@ export default function App() {
     setGameMode(null);
     setJoinCode('');
     inputSeqRef.current = 0;
-    serverPlayerRef.current = null;
     serverRemotePlayersRef.current = {};
+    serverAlliesRef.current = {};
+    serverEnemiesRef.current = {};
+    pendingInputsRef.current = [];
     multiInputRef.current = { seq: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
     multiOutcomeRef.current = { gameOver: false, gameWon: false };
     setMultiState({ roomCode: '', isHost: false, players: [], status: 'lobby', matchType: 'versus', error: '' });
@@ -276,7 +271,17 @@ export default function App() {
     setMultiState(prev => ({ ...prev, matchType: snapshot.matchType }));
 
     const authoritativePlayer = { ...(snapshot.players[socketId] ?? createEmptyPlayer()), id: 'player' };
-    serverPlayerRef.current = authoritativePlayer;
+    const lastProcessedInputSeq = authoritativePlayer.lastProcessedInputSeq ?? 0;
+    pendingInputsRef.current = pendingInputsRef.current.filter((input) => input.seq > lastProcessedInputSeq);
+
+    const localPlayer = {
+      ...authoritativePlayer,
+      pos: { ...authoritativePlayer.pos },
+      pushVelocity: { ...authoritativePlayer.pushVelocity },
+    };
+    for (const input of pendingInputsRef.current) {
+      applyPredictedMovement(localPlayer, input, snapshot.walls);
+    }
 
     const remoteTargets: Record<string, Entity> = Object.fromEntries(
       (Object.entries(snapshot.players) as [string, Entity][])
@@ -284,32 +289,16 @@ export default function App() {
         .map(([id, player]) => [id, { ...player, id: `remote-${id}` }])
     );
     serverRemotePlayersRef.current = remoteTargets;
+    serverAlliesRef.current = Object.fromEntries(snapshot.allies.map((entity) => [entity.id, { ...entity }]));
+    serverEnemiesRef.current = Object.fromEntries(snapshot.enemies.map((entity) => [entity.id, { ...entity }]));
 
     const currentState = gameStateRef.current;
-    const localPlayer = currentState?.player
-      ? {
-          ...currentState.player,
-          hp: authoritativePlayer.hp,
-          maxHp: authoritativePlayer.maxHp,
-          isDead: authoritativePlayer.isDead,
-          lastAttackTime: authoritativePlayer.lastAttackTime,
-          lastSkillTime: authoritativePlayer.lastSkillTime,
-          lastHitTime: authoritativePlayer.lastHitTime,
-          pushVelocity: { ...authoritativePlayer.pushVelocity },
-          attackCooldown: authoritativePlayer.attackCooldown,
-          skillCooldown: authoritativePlayer.skillCooldown,
-          attackRange: authoritativePlayer.attackRange,
-          attackDamage: authoritativePlayer.attackDamage,
-          facingAngle: authoritativePlayer.facingAngle,
-          lastProcessedInputSeq: authoritativePlayer.lastProcessedInputSeq,
-        }
-      : authoritativePlayer;
 
     gameStateRef.current = {
       player: localPlayer,
       remotePlayers: currentState?.remotePlayers ?? {},
-      allies: snapshot.allies,
-      enemies: snapshot.enemies,
+      allies: currentState?.allies ?? snapshot.allies,
+      enemies: currentState?.enemies ?? snapshot.enemies,
       particles: [],
       damageTexts: [],
       walls: snapshot.walls,
@@ -356,8 +345,10 @@ export default function App() {
 
     if (mode === 'multi') {
       inputSeqRef.current = 0;
-      serverPlayerRef.current = null;
       serverRemotePlayersRef.current = {};
+      serverAlliesRef.current = {};
+      serverEnemiesRef.current = {};
+      pendingInputsRef.current = [];
       multiInputRef.current = { seq: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
       multiOutcomeRef.current = { gameOver: false, gameWon: false };
       gameStateRef.current = {
