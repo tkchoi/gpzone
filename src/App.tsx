@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 // Version: 1.1.0 - Multiplayer Support
 import { motion, AnimatePresence } from 'motion/react';
-import { Sword, Zap, Skull, Play, Trophy, ShieldAlert, Pause, RotateCcw, Users, UserPlus, LogIn, Copy, Check } from 'lucide-react';
+import { Sword, Zap, Skull, Play, Trophy, ShieldAlert, Pause, RotateCcw, Users, UserPlus, LogIn, Copy, Check, LogOut } from 'lucide-react';
 import { PieceType, Team, Entity, Particle, DamageText, GameState, Wall } from './types';
 import { soundManager } from './SoundManager';
 import { io, Socket } from 'socket.io-client';
@@ -13,6 +13,7 @@ const MAP_HEIGHT = 1600;
 
 type MultiplayerInputState = {
   seq: number;
+  roundId: number;
   clientTime: number;
   moveX: number;
   moveY: number;
@@ -22,6 +23,7 @@ type MultiplayerInputState = {
 
 type MultiplayerSnapshot = {
   players: Record<string, Entity>;
+  playerScores: Record<string, number>;
   allies: Entity[];
   enemies: Entity[];
   walls: Wall[];
@@ -32,6 +34,7 @@ type MultiplayerSnapshot = {
   status: 'lobby' | 'playing';
   matchType: 'coop' | 'versus';
   serverTime: number;
+  roundId: number;
 };
 
 // Hashima Island (Gunkanjima) style ruined concrete map
@@ -60,6 +63,9 @@ export default function App() {
   const [isPaused, setIsPaused] = useState(false);
   const [uiState, setUiState] = useState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
   const requestRef = useRef<number>(null);
+  const cameraRef = useRef({ x: 0, y: 0 });
+  const attackReleaseTimeoutRef = useRef<number | null>(null);
+  const skillReleaseTimeoutRef = useRef<number | null>(null);
   const keysPressed = useRef<Set<string>>(new Set());
   const gameStateRef = useRef<GameState | null>(null);
   
@@ -74,21 +80,24 @@ export default function App() {
   const [multiState, setMultiState] = useState<{
     roomCode: string;
     isHost: boolean;
-    players: string[];
-    status: 'lobby' | 'playing';
+    players: { id: string; color: string }[];
+    status: 'lobby' | 'playing' | 'gameover';
     matchType: 'coop' | 'versus';
     error: string;
   }>({ roomCode: '', isHost: false, players: [], status: 'lobby', matchType: 'versus', error: '' });
+  const [multiScores, setMultiScores] = useState<Record<string, number>>({});
   const [joinCode, setJoinCode] = useState('');
   const [copied, setCopied] = useState(false);
   const socketRef = useRef<Socket | null>(null);
-  const multiInputRef = useRef<MultiplayerInputState>({ seq: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false });
+  const multiInputRef = useRef<MultiplayerInputState>({ seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false });
   const multiOutcomeRef = useRef({ gameOver: false, gameWon: false });
   const gameModeRef = useRef<'single' | 'multi' | null>(null);
   const roomCodeRef = useRef('');
   const pendingAutoJoinRef = useRef('');
   const inputSeqRef = useRef(0);
+  const roundIdRef = useRef(0);
   const pendingInputsRef = useRef<MultiplayerInputState[]>([]);
+  const lastHitTimesRef = useRef<Record<string, number>>({});
 
   const isPlayingRef = useRef(false);
   const isPausedRef = useRef(false);
@@ -97,7 +106,9 @@ export default function App() {
   
   const lastTimeRef = useRef<number>(0);
   const accumulatorRef = useRef<number>(0);
-  const TIME_STEP = 1000 / 60; // 60 FPS fixed timestep
+  const SINGLE_TIME_STEP = 1000 / 60;
+  const MULTI_TIME_STEP = 1000 / 30;
+  const MULTI_SPEED = 10;
 
   const createEmptyPlayer = (): Entity => ({
     id: 'player',
@@ -121,12 +132,18 @@ export default function App() {
     lastHitTime: 0,
   });
 
-  const applyPredictedMovement = (player: Entity, input: MultiplayerInputState, walls: Wall[]) => {
-    player.pos.x += player.pushVelocity.x;
-    player.pos.y += player.pushVelocity.y;
-    player.pushVelocity.x *= 0.82;
-    player.pushVelocity.y *= 0.82;
+  const createEmptyMultiplayerPlayer = (): Entity => ({
+    ...createEmptyPlayer(),
+    speed: MULTI_SPEED,
+  });
 
+  const applyLocalMapBounds = (entity: Entity) => {
+    const margin = 60 + entity.radius;
+    entity.pos.x = Math.max(margin, Math.min(MAP_WIDTH - margin, entity.pos.x));
+    entity.pos.y = Math.max(margin, Math.min(MAP_HEIGHT - margin, entity.pos.y));
+  };
+
+  const applyPredictedMovement = (player: Entity, input: MultiplayerInputState, walls: Wall[]) => {
     const magnitude = Math.hypot(input.moveX, input.moveY);
     if (magnitude > 0) {
       const moveX = input.moveX / magnitude;
@@ -136,41 +153,60 @@ export default function App() {
       player.facingAngle = Math.atan2(moveY, moveX);
     }
 
-    const margin = 60 + player.radius;
-    player.pos.x = Math.max(margin, Math.min(MAP_WIDTH - margin, player.pos.x));
-    player.pos.y = Math.max(margin, Math.min(MAP_HEIGHT - margin, player.pos.y));
+    player.pos.x += player.pushVelocity.x;
+    player.pos.y += player.pushVelocity.y;
+    player.pushVelocity.x *= 0.8;
+    player.pushVelocity.y *= 0.8;
+
     resolveWallCollision(player, walls);
+    applyLocalMapBounds(player);
   };
 
   const predictMultiplayerStep = () => {
     const state = gameStateRef.current;
     if (!state) return;
 
-    const player = state.player;
-    const currentInput = multiInputRef.current;
-    applyPredictedMovement(player, currentInput, state.walls);
-  };
-
-
-  const syncMultiInput = (patch: Partial<MultiplayerInputState> = {}) => {
-    const nextInput = {
+    const sampledInput = {
       ...multiInputRef.current,
-      ...patch,
       seq: inputSeqRef.current + 1,
+      roundId: roundIdRef.current,
       clientTime: Date.now()
     };
-    inputSeqRef.current = nextInput.seq;
-    multiInputRef.current = nextInput;
+    inputSeqRef.current = sampledInput.seq;
+    multiInputRef.current = sampledInput;
+    pendingInputsRef.current.push(sampledInput);
+    if (pendingInputsRef.current.length > 120) {
+      pendingInputsRef.current = pendingInputsRef.current.slice(-120);
+    }
 
     if (gameModeRef.current === 'multi' && roomCodeRef.current) {
-      pendingInputsRef.current.push(nextInput);
-      if (pendingInputsRef.current.length > 120) {
-        pendingInputsRef.current = pendingInputsRef.current.slice(-120);
-      }
       socketRef.current?.emit('player-input', {
         roomCode: roomCodeRef.current,
-        input: nextInput
+        input: sampledInput
       });
+    }
+
+    applyPredictedMovement(state.player, sampledInput, state.walls);
+  };
+
+  const syncMultiInput = (patch: Partial<MultiplayerInputState> = {}) => {
+    multiInputRef.current = {
+      ...multiInputRef.current,
+      ...patch,
+    };
+  };
+
+  const clearTransientInputs = () => {
+    keysPressed.current.clear();
+    joystickRef.current = { x: 0, y: 0 };
+    setJoystick({ active: false, x: 0, y: 0, startX: 0, startY: 0 });
+    if (attackReleaseTimeoutRef.current !== null) {
+      window.clearTimeout(attackReleaseTimeoutRef.current);
+      attackReleaseTimeoutRef.current = null;
+    }
+    if (skillReleaseTimeoutRef.current !== null) {
+      window.clearTimeout(skillReleaseTimeoutRef.current);
+      skillReleaseTimeoutRef.current = null;
     }
   };
 
@@ -178,9 +214,7 @@ export default function App() {
     if (leaveMultiRoom && multiState.roomCode) {
       socketRef.current?.emit('leave-room');
     }
-    keysPressed.current.clear();
-    joystickRef.current = { x: 0, y: 0 };
-    setJoystick({ active: false, x: 0, y: 0, startX: 0, startY: 0 });
+    clearTransientInputs();
     if (requestRef.current) cancelAnimationFrame(requestRef.current);
     isPlayingRef.current = false;
     setIsPlaying(false);
@@ -194,10 +228,14 @@ export default function App() {
     setGameMode(null);
     setJoinCode('');
     inputSeqRef.current = 0;
+    roundIdRef.current = 0;
     pendingInputsRef.current = [];
-    multiInputRef.current = { seq: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
+    lastHitTimesRef.current = {};
+    cameraRef.current = { x: 0, y: 0 };
+    multiInputRef.current = { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
     multiOutcomeRef.current = { gameOver: false, gameWon: false };
     setMultiState({ roomCode: '', isHost: false, players: [], status: 'lobby', matchType: 'versus', error: '' });
+    setMultiScores({});
     gameStateRef.current = null;
     setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
   };
@@ -205,19 +243,85 @@ export default function App() {
   const applyMultiplayerSnapshot = (snapshot: MultiplayerSnapshot) => {
     const socketId = socketRef.current?.id;
     if (!socketId) return;
+    if (snapshot.roundId < roundIdRef.current) return;
     setMultiState(prev => ({ ...prev, matchType: snapshot.matchType }));
+    if (snapshot.roundId !== roundIdRef.current) {
+      roundIdRef.current = snapshot.roundId;
+      inputSeqRef.current = 0;
+      pendingInputsRef.current = [];
+      lastHitTimesRef.current = {};
+      multiInputRef.current = {
+        seq: 0,
+        roundId: snapshot.roundId,
+        clientTime: Date.now(),
+        moveX: 0,
+        moveY: 0,
+        attack: false,
+        skill: false,
+      };
+    }
 
-    const authoritativePlayer = { ...(snapshot.players[socketId] ?? createEmptyPlayer()), id: 'player' };
+    const authoritativePlayer = { ...(snapshot.players[socketId] ?? createEmptyMultiplayerPlayer()), id: 'player' };
     const lastProcessedInputSeq = authoritativePlayer.lastProcessedInputSeq ?? 0;
     pendingInputsRef.current = pendingInputsRef.current.filter((input) => input.seq > lastProcessedInputSeq);
 
-    const localPlayer = {
+    const replayedPlayer = {
       ...authoritativePlayer,
       pos: { ...authoritativePlayer.pos },
       pushVelocity: { ...authoritativePlayer.pushVelocity },
     };
     for (const input of pendingInputsRef.current) {
-      applyPredictedMovement(localPlayer, input, snapshot.walls);
+      applyPredictedMovement(replayedPlayer, input, snapshot.walls);
+    }
+
+    const currentDisplayedPlayer = gameStateRef.current?.player;
+    const localPlayer = currentDisplayedPlayer
+      ? {
+          ...currentDisplayedPlayer,
+          hp: replayedPlayer.hp,
+          maxHp: replayedPlayer.maxHp,
+          isDead: replayedPlayer.isDead,
+          team: replayedPlayer.team,
+          color: replayedPlayer.color,
+          baseColor: replayedPlayer.baseColor,
+          playerIndex: replayedPlayer.playerIndex,
+          lastAttackTime: replayedPlayer.lastAttackTime,
+          lastSkillTime: replayedPlayer.lastSkillTime,
+          lastHitTime: replayedPlayer.lastHitTime,
+          attackCooldown: replayedPlayer.attackCooldown,
+          skillCooldown: replayedPlayer.skillCooldown,
+          attackRange: replayedPlayer.attackRange,
+          attackDamage: replayedPlayer.attackDamage,
+          pushVelocity: { ...replayedPlayer.pushVelocity },
+          lastProcessedInputSeq: replayedPlayer.lastProcessedInputSeq,
+        }
+      : replayedPlayer;
+
+    if (currentDisplayedPlayer) {
+      const dx = replayedPlayer.pos.x - currentDisplayedPlayer.pos.x;
+      const dy = replayedPlayer.pos.y - currentDisplayedPlayer.pos.y;
+      const dist = Math.hypot(dx, dy);
+
+      if (dist < 0.1) {
+        localPlayer.pos = { ...replayedPlayer.pos };
+      } else if (dist < 600) {
+        // Correct 15% of the error per snapshot to keep it smooth but convergent
+        localPlayer.pos = {
+          x: currentDisplayedPlayer.pos.x + dx * 0.15,
+          y: currentDisplayedPlayer.pos.y + dy * 0.15,
+        };
+      } else {
+        // Big jump, snap to server
+        localPlayer.pos = { ...replayedPlayer.pos };
+      }
+
+      let facingDelta = replayedPlayer.facingAngle - currentDisplayedPlayer.facingAngle;
+      while (facingDelta > Math.PI) facingDelta -= Math.PI * 2;
+      while (facingDelta < -Math.PI) facingDelta += Math.PI * 2;
+      
+      localPlayer.facingAngle = Math.abs(facingDelta) < 0.01
+        ? replayedPlayer.facingAngle
+        : currentDisplayedPlayer.facingAngle + facingDelta * 0.2;
     }
 
     const remoteTargets: Record<string, Entity> = Object.fromEntries(
@@ -226,19 +330,57 @@ export default function App() {
         .map(([id, player]) => [id, { ...player, id: `remote-${id}` }])
     );
 
+    const nextAllies = snapshot.allies.map((ally) => ({
+      ...ally,
+      pos: { ...ally.pos },
+      pushVelocity: { ...ally.pushVelocity },
+    }));
+
+    const nextEnemies = snapshot.enemies.map((enemy) => ({
+      ...enemy,
+      pos: { ...enemy.pos },
+      pushVelocity: { ...enemy.pushVelocity },
+    }));
+
+    const nextEntitiesForHitFx = [
+      localPlayer,
+      ...Object.values(remoteTargets),
+      ...nextAllies,
+      ...nextEnemies,
+    ];
+
     gameStateRef.current = {
       player: localPlayer,
       remotePlayers: remoteTargets,
-      allies: snapshot.allies,
-      enemies: snapshot.enemies,
-      particles: [],
-      damageTexts: [],
+      playerScores: snapshot.playerScores,
+      allies: nextAllies,
+      enemies: nextEnemies,
+      particles: gameStateRef.current?.particles ?? [],
+      damageTexts: gameStateRef.current?.damageTexts ?? [],
       walls: snapshot.walls,
       score: snapshot.score,
       gameOver: snapshot.gameOver,
       gameWon: snapshot.gameWon,
       screenShake: snapshot.screenShake,
     };
+    setMultiScores(snapshot.playerScores);
+
+    for (const entity of nextEntitiesForHitFx) {
+      const previousLastHitTime = lastHitTimesRef.current[entity.id] ?? 0;
+      if (entity.lastHitTime > previousLastHitTime) {
+        spawnParticles(
+          entity.pos.x,
+          entity.pos.y,
+          entity.team === Team.BLUE ? '#3b82f6' : 
+          (entity.team === Team.RED ? '#ef4444' : 
+          (entity.team === Team.YELLOW ? '#eab308' : 
+          (entity.team === Team.BLACK ? '#3f3f46' : 
+          (entity.team === Team.NEUTRAL ? '#d1d5db' : '#ef4444')))),
+          entity.type === PieceType.KING ? 10 : 6
+        );
+      }
+      lastHitTimesRef.current[entity.id] = entity.lastHitTime;
+    }
 
     const elapsed = Math.max(0, Date.now() - localPlayer.lastSkillTime);
     const skillPercent = Math.min(100, (elapsed / localPlayer.skillCooldown) * 100);
@@ -253,16 +395,8 @@ export default function App() {
     }
     multiOutcomeRef.current = { gameOver: snapshot.gameOver, gameWon: snapshot.gameWon };
 
-    if (!snapshot.gameOver && !snapshot.gameWon) {
-      isPlayingRef.current = true;
-      setIsPlaying(true);
-    } else {
-      isPlayingRef.current = false;
-      setIsPlaying(false);
-    }
-
     setUiState({
-      score: snapshot.score,
+      score: snapshot.playerScores[socketId] ?? 0,
       skillPercent,
       gameOver: snapshot.gameOver,
       gameWon: snapshot.gameWon,
@@ -277,11 +411,14 @@ export default function App() {
 
     if (mode === 'multi') {
       inputSeqRef.current = 0;
+      roundIdRef.current = 0;
       pendingInputsRef.current = [];
-      multiInputRef.current = { seq: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
+      multiInputRef.current = { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
       multiOutcomeRef.current = { gameOver: false, gameWon: false };
+      setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
+      setMultiScores({});
       gameStateRef.current = {
-        player: createEmptyPlayer(),
+        player: createEmptyMultiplayerPlayer(),
         remotePlayers: {},
         allies: [],
         enemies: [],
@@ -293,7 +430,7 @@ export default function App() {
         gameWon: false,
         screenShake: 0,
       };
-      setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
+      cameraRef.current = { x: 0, y: 0 };
       totalPausedTimeRef.current = 0;
       pauseStartTimeRef.current = 0;
       lastTimeRef.current = performance.now();
@@ -322,6 +459,10 @@ export default function App() {
     gameStateRef.current = {
       player, remotePlayers: {}, allies: [], enemies: [boss], particles: [], damageTexts: [], walls: INITIAL_WALLS,
       score: 0, gameOver: false, gameWon: false, screenShake: 0,
+    };
+    cameraRef.current = {
+      x: Math.max(0, Math.min(Math.max(0, MAP_WIDTH - canvasSize.width), player.pos.x - canvasSize.width / 2)),
+      y: Math.max(0, Math.min(Math.max(0, MAP_HEIGHT - canvasSize.height), player.pos.y - canvasSize.height / 2)),
     };
     
     // Initial guards
@@ -455,11 +596,52 @@ export default function App() {
   };
 
   const leaveRoom = () => {
-    resetToMenu(true);
+    socketRef.current?.emit('leave-room');
+    clearTransientInputs();
+    if (requestRef.current) cancelAnimationFrame(requestRef.current);
+    isPlayingRef.current = false;
+    setIsPlaying(false);
+    setIsPaused(false);
+    isPausedRef.current = false;
+    soundManager.stopBGM();
+    roomCodeRef.current = '';
+    inputSeqRef.current = 0;
+    roundIdRef.current = 0;
+    pendingInputsRef.current = [];
+    multiInputRef.current = { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
+    multiOutcomeRef.current = { gameOver: false, gameWon: false };
+    gameStateRef.current = null;
+    setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
+    setMultiScores({});
+    setGameMode(null);
+    setJoinCode('');
+    setMultiState({ roomCode: '', isHost: false, players: [], status: 'lobby', matchType: 'versus', error: '' });
   };
 
   const startGameMulti = () => {
-    socketRef.current?.emit('start-game', multiState.roomCode);
+    const code = roomCodeRef.current || multiState.roomCode;
+    if (!socketRef.current?.connected) {
+      setMultiState(prev => ({ ...prev, error: 'Server connection unavailable' }));
+      return;
+    }
+    if (!code) {
+      setMultiState(prev => ({ ...prev, error: 'Room code unavailable' }));
+      return;
+    }
+    socketRef.current.emit('start-game', code);
+  };
+
+  const retryGameMulti = () => {
+    const code = roomCodeRef.current || multiState.roomCode;
+    if (!socketRef.current?.connected) {
+      setMultiState(prev => ({ ...prev, error: 'Server connection unavailable' }));
+      return;
+    }
+    if (!code) {
+      setMultiState(prev => ({ ...prev, error: 'Room code unavailable' }));
+      return;
+    }
+    socketRef.current.emit('retry-game', code);
   };
 
   const copyRoomCode = () => {
@@ -492,6 +674,24 @@ export default function App() {
       vel: { x: (Math.random() - 0.5) * 2, y: -2 - Math.random() * 2 },
       text, color, life: 0, maxLife: 40
     });
+  };
+
+  const updateVisualEffects = (state: GameState, stepScale = 1) => {
+    for (let i = state.particles.length - 1; i >= 0; i--) {
+      const particle = state.particles[i];
+      particle.pos.x += particle.vel.x * stepScale;
+      particle.pos.y += particle.vel.y * stepScale;
+      particle.life += stepScale;
+      if (particle.life >= particle.maxLife) state.particles.splice(i, 1);
+    }
+
+    for (let i = state.damageTexts.length - 1; i >= 0; i--) {
+      const damageText = state.damageTexts[i];
+      damageText.pos.x += damageText.vel.x * stepScale;
+      damageText.pos.y += damageText.vel.y * stepScale;
+      damageText.life += stepScale;
+      if (damageText.life >= damageText.maxLife) state.damageTexts.splice(i, 1);
+    }
   };
 
   const resolveWallCollision = (entity: Entity, walls: Wall[]) => {
@@ -857,17 +1057,7 @@ export default function App() {
       }
     }
 
-    // Update Particles & Texts
-    for (let i = particles.length - 1; i >= 0; i--) {
-      const p = particles[i];
-      p.pos.x += p.vel.x; p.pos.y += p.vel.y; p.life++;
-      if (p.life >= p.maxLife) particles.splice(i, 1);
-    }
-    for (let i = damageTexts.length - 1; i >= 0; i--) {
-      const dt = damageTexts[i];
-      dt.pos.x += dt.vel.x; dt.pos.y += dt.vel.y; dt.life++;
-      if (dt.life >= dt.maxLife) damageTexts.splice(i, 1);
-    }
+    updateVisualEffects(state);
 
     if (state.screenShake > 0) state.screenShake *= 0.9;
     if (state.screenShake < 0.5) state.screenShake = 0;
@@ -893,22 +1083,30 @@ export default function App() {
     if (!lastTimeRef.current) lastTimeRef.current = time;
     const deltaTime = time - lastTimeRef.current;
     lastTimeRef.current = time;
+    const currentTimeStep = gameModeRef.current === 'multi' ? MULTI_TIME_STEP : SINGLE_TIME_STEP;
 
-    if (!gameStateRef.current || gameStateRef.current.gameOver || gameStateRef.current.gameWon || isPausedRef.current) {
+    if (!gameStateRef.current || isPausedRef.current) {
       requestRef.current = requestAnimationFrame(update);
       return;
     }
 
     accumulatorRef.current += deltaTime;
-    if (accumulatorRef.current > 100) accumulatorRef.current = 100; // Cap to prevent spiral of death
+    if (accumulatorRef.current > currentTimeStep * 4) accumulatorRef.current = currentTimeStep * 4;
 
-    while (accumulatorRef.current >= TIME_STEP) {
-      if (gameModeRef.current === 'multi') {
-        predictMultiplayerStep();
+    while (accumulatorRef.current >= currentTimeStep) {
+      if (!gameStateRef.current.gameOver && !gameStateRef.current.gameWon) {
+        if (gameModeRef.current === 'multi') {
+          predictMultiplayerStep();
+          if (gameStateRef.current) {
+            updateVisualEffects(gameStateRef.current);
+          }
+        } else {
+          simulateStep();
+        }
       } else {
-        simulateStep();
+        updateVisualEffects(gameStateRef.current);
       }
-      accumulatorRef.current -= TIME_STEP;
+      accumulatorRef.current -= currentTimeStep;
     }
 
     draw(gameStateRef.current, Date.now() - totalPausedTimeRef.current);
@@ -921,14 +1119,17 @@ export default function App() {
 
     const isHit = now - entity.lastHitTime < 100;
     const isBlue = entity.team === Team.BLUE;
-    const isBoss = entity.type === PieceType.KING && entity.team === Team.RED;
+    const isBoss = entity.type === PieceType.KING && entity.team === Team.RED && !entity.id.startsWith('remote-') && entity.id !== 'player';
     const isNeutral = entity.team === Team.NEUTRAL;
     const isRemote = entity.id.startsWith('remote-');
-    
+
     let baseColor = isHit ? '#ffffff' : (isNeutral ? '#d1d5db' : (isBlue ? (isRemote ? '#064e3b' : '#1e3a8a') : '#7f1d1d'));
     let topColor = isHit ? '#ffffff' : (isNeutral ? '#ffffff' : (isBlue ? (isRemote ? '#10b981' : '#3b82f6') : '#ef4444'));
     
-    if (isBoss) {
+    if (entity.color && entity.baseColor) {
+      topColor = isHit ? '#ffffff' : entity.color;
+      baseColor = isHit ? '#ffffff' : entity.baseColor;
+    } else if (isBoss) {
       baseColor = isHit ? '#ffffff' : '#450a0a';
       topColor = isHit ? '#ffffff' : '#b91c1c';
     }
@@ -967,7 +1168,10 @@ export default function App() {
       ctx.fillStyle = '#ffffff';
       ctx.font = 'bold 12px sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText(isLocalPlayer ? 'YOU' : 'PLAYER', 0, -height - entity.radius - 5);
+      const label = entity.playerIndex !== undefined 
+        ? `PLAYER ${entity.playerIndex + 1}${isLocalPlayer ? ' (YOU)' : ''}`
+        : (isLocalPlayer ? 'YOU' : 'PLAYER');
+      ctx.fillText(label, 0, -height - entity.radius - 5);
     }
 
     // Visor/Face
@@ -1019,6 +1223,8 @@ export default function App() {
     const fillPercent = Math.max(0, entity.hp / entity.maxHp);
     if (isNeutral) {
       ctx.fillStyle = '#9ca3af';
+    } else if (entity.color) {
+      ctx.fillStyle = entity.color;
     } else {
       ctx.fillStyle = isBlue ? '#22c55e' : (isBoss ? '#a855f7' : '#ef4444');
     }
@@ -1041,10 +1247,19 @@ export default function App() {
     if (!ctx) return;
 
     // Camera logic: center on player, clamp to map bounds
-    let camX = state.player.pos.x - canvasSize.width / 2;
-    let camY = state.player.pos.y - canvasSize.height / 2;
-    camX = Math.max(0, Math.min(Math.max(0, MAP_WIDTH - canvasSize.width), camX));
-    camY = Math.max(0, Math.min(Math.max(0, MAP_HEIGHT - canvasSize.height), camY));
+    const targetCamX = Math.max(0, Math.min(Math.max(0, MAP_WIDTH - canvasSize.width), state.player.pos.x - canvasSize.width / 2));
+    const targetCamY = Math.max(0, Math.min(Math.max(0, MAP_HEIGHT - canvasSize.height), state.player.pos.y - canvasSize.height / 2));
+    const currentCam = cameraRef.current;
+    const smoothing = gameModeRef.current === 'multi' ? 0.18 : 0.35;
+
+    currentCam.x += (targetCamX - currentCam.x) * smoothing;
+    currentCam.y += (targetCamY - currentCam.y) * smoothing;
+
+    if (Math.abs(targetCamX - currentCam.x) < 0.5) currentCam.x = targetCamX;
+    if (Math.abs(targetCamY - currentCam.y) < 0.5) currentCam.y = targetCamY;
+
+    const camX = currentCam.x;
+    const camY = currentCam.y;
 
     ctx.save();
     
@@ -1196,16 +1411,20 @@ export default function App() {
     });
 
     socketRef.current.on('room-created', (code) => {
+      roomCodeRef.current = code;
       setMultiState(prev => ({ ...prev, roomCode: code, isHost: true, status: 'lobby', error: '' }));
     });
 
     socketRef.current.on('room-joined', (code) => {
+      roomCodeRef.current = code;
       setMultiState(prev => ({ ...prev, roomCode: code, isHost: false, status: 'lobby', error: '' }));
     });
 
     socketRef.current.on('room-update', (data) => {
+      if (data.code) roomCodeRef.current = data.code;
       setMultiState(prev => ({
         ...prev,
+        roomCode: data.code ?? prev.roomCode,
         players: data.players,
         isHost: data.hostId === socketRef.current?.id,
         status: data.status ?? prev.status,
@@ -1213,8 +1432,26 @@ export default function App() {
       }));
     });
 
-    socketRef.current.on('game-started', () => {
+    socketRef.current.on('game-started', (data?: { roundId?: number }) => {
+      roundIdRef.current = data?.roundId ?? roundIdRef.current + 1;
+      clearTransientInputs();
+      inputSeqRef.current = 0;
+      pendingInputsRef.current = [];
+      multiInputRef.current = {
+        seq: 0,
+        roundId: roundIdRef.current,
+        clientTime: Date.now(),
+        moveX: 0,
+        moveY: 0,
+        attack: false,
+        skill: false,
+      };
       setMultiState(prev => ({ ...prev, status: 'playing' }));
+      setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
+      socketRef.current?.emit('player-input', {
+        roomCode: roomCodeRef.current,
+        input: multiInputRef.current
+      });
       initGame('multi');
     });
 
@@ -1324,15 +1561,27 @@ export default function App() {
   const triggerAttack = () => {
     keysPressed.current.add('z');
     syncMultiInput({ attack: true });
-    setTimeout(() => keysPressed.current.delete('z'), 100);
-    setTimeout(() => syncMultiInput({ attack: false }), 100);
+    if (attackReleaseTimeoutRef.current !== null) {
+      window.clearTimeout(attackReleaseTimeoutRef.current);
+    }
+    attackReleaseTimeoutRef.current = window.setTimeout(() => {
+      keysPressed.current.delete('z');
+      syncMultiInput({ attack: false });
+      attackReleaseTimeoutRef.current = null;
+    }, 100);
   };
 
   const triggerSkill = () => {
     keysPressed.current.add('x');
     syncMultiInput({ skill: true });
-    setTimeout(() => keysPressed.current.delete('x'), 100);
-    setTimeout(() => syncMultiInput({ skill: false }), 100);
+    if (skillReleaseTimeoutRef.current !== null) {
+      window.clearTimeout(skillReleaseTimeoutRef.current);
+    }
+    skillReleaseTimeoutRef.current = window.setTimeout(() => {
+      keysPressed.current.delete('x');
+      syncMultiInput({ skill: false });
+      skillReleaseTimeoutRef.current = null;
+    }, 100);
   };
 
   return (
@@ -1361,7 +1610,7 @@ export default function App() {
               </div>
               <div className="w-px h-8 bg-zinc-800"></div>
               <div className="flex flex-col items-end">
-                <span className="text-[10px] uppercase text-zinc-500 font-black tracking-wider">Blue Army</span>
+                <span className="text-[10px] uppercase text-zinc-500 font-black tracking-wider">MY ARMY</span>
                 <span className="text-2xl font-black italic text-blue-500">{uiState.allyCount}</span>
               </div>
             </div>
@@ -1493,13 +1742,13 @@ export default function App() {
                     <div className="w-full p-6 bg-zinc-900 border-2 border-zinc-800 rounded-3xl flex flex-col items-center gap-4">
                       <span className="text-zinc-500 font-black uppercase text-[10px] tracking-widest">Connected Players</span>
                       <div className="flex flex-wrap justify-center gap-2">
-                        {multiState.players.map((id, idx) => (
-                          <div key={id} className="px-4 py-2 bg-zinc-800 rounded-xl border border-zinc-700 text-white font-black italic text-sm">
-                            PLAYER {idx + 1} {id === socketRef.current?.id ? '(YOU)' : ''}
+                        {multiState.players.map((p, idx) => (
+                          <div key={p.id} className="flex items-center gap-2 px-4 py-2 bg-zinc-800 rounded-xl border border-zinc-700 text-white font-black italic text-sm">
+                            <div className="w-2 h-2 rounded-full" style={{ backgroundColor: p.color }} />
+                            PLAYER {idx + 1} {p.id === socketRef.current?.id ? '(YOU)' : ''}
                           </div>
                         ))}
-                      </div>
-                    </div>
+                      </div>                    </div>
 
                     <div className="flex gap-2 w-full">
                       <button 
@@ -1608,12 +1857,19 @@ export default function App() {
           </div>
         )}
 
-        {/* UI HUD Overlay (Mobile) */}
-        {isMobile && isPlaying && (
+        {/* UI HUD Overlay */}
+        {isPlaying && (
           <div className="absolute top-6 left-6 right-6 flex justify-between items-start pointer-events-none">
             <div className="flex flex-col gap-2">
-              <div className="text-4xl font-black italic tracking-tighter text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.8)]">
-                {uiState.score.toLocaleString()}
+              <div className="flex flex-col">
+                {gameMode === 'multi' && gameStateRef.current?.player && (
+                  <div className="text-[10px] font-black italic text-white/60 tracking-widest uppercase -mb-1 ml-1">
+                    {`${gameStateRef.current.player.team} SCORE`}
+                  </div>
+                )}
+                <div className="text-4xl font-black italic tracking-tighter text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.8)]">
+                  {uiState.score.toLocaleString()}
+                </div>
               </div>
               <div className="flex items-center gap-2 bg-blue-900/40 px-3 py-1 rounded-full border border-blue-500/30 backdrop-blur-md">
                 <Skull className="w-4 h-4 text-blue-400" />
@@ -1736,26 +1992,63 @@ export default function App() {
                 </div>
               )}
               
-              <div className="bg-white/5 backdrop-blur-md border border-white/10 p-8 rounded-[32px] mb-12 min-w-[300px]">
-                <div className="text-zinc-500 text-xs uppercase tracking-widest font-bold mb-1">Final Score</div>
-                <div className="text-6xl font-black italic text-white tracking-tighter">
-                  {uiState.score.toLocaleString()}
-                </div>
+      <div className="flex flex-col gap-4 w-full max-w-2xl mb-12">
+                {gameMode === 'multi' && (multiState.status === 'playing' || uiState.gameOver || uiState.gameWon) ? (
+                  multiState.players.map((p, idx) => {
+                    const isLocal = p.id === socketRef.current?.id;
+                    const playerScore = multiScores[p.id] || 0;
+                    return (
+                      <div key={p.id} className={`flex items-center justify-between p-6 rounded-2xl border ${isLocal ? 'bg-blue-500/10 border-blue-500/30' : 'bg-white/5 border-white/10'}`}>
+                        <div className="flex items-center gap-4">
+                          <div className="w-4 h-4 rounded-full" style={{ backgroundColor: p.color }} />
+                          <span className="text-xl font-black italic text-white uppercase tracking-tight">
+                            PLAYER {idx + 1} {isLocal ? '(YOU)' : ''}
+                          </span>
+                        </div>
+                        <div className="text-3xl font-black italic text-white">
+                          {playerScore.toLocaleString()}
+                        </div>
+                      </div>
+                    );
+                  })
+                ) : (
+                  <div className="bg-white/5 backdrop-blur-md border border-white/10 p-8 rounded-[32px] min-w-[300px] flex flex-col items-center">
+                    <div className="text-zinc-500 text-xs uppercase tracking-widest font-bold mb-1">Final Score</div>
+                    <div className="text-6xl font-black italic text-white tracking-tighter">
+                      {uiState.score.toLocaleString()}
+                    </div>
+                  </div>
+                )}
               </div>
 
-              <button
-                onClick={() => {
-                  if (gameMode === 'multi') {
-                    resetToMenu(true);
-                    return;
-                  }
-                  initGame('single');
-                }}
-                className="flex items-center gap-4 px-12 py-6 bg-white text-black rounded-full font-black italic text-2xl hover:scale-105 transition-transform shadow-xl"
-              >
-                <RotateCcw className="w-8 h-8" />
-                {gameMode === 'multi' ? 'LEAVE ROOM' : 'REDEPLOY'}
-              </button>
+              {gameMode === 'multi' ? (
+                <div className="flex flex-col gap-4 w-full max-w-sm">
+                  {multiState.isHost && (
+                    <button
+                      onClick={retryGameMulti}
+                      className="flex items-center justify-center gap-4 px-12 py-6 bg-white text-black rounded-full font-black italic text-2xl hover:scale-105 transition-transform shadow-xl"
+                    >
+                      <RotateCcw className="w-8 h-8" />
+                      RETRY
+                    </button>
+                  )}
+                  <button
+                    onClick={leaveRoom}
+                    className="flex items-center justify-center gap-4 px-12 py-6 bg-zinc-800 text-white rounded-full font-black italic text-2xl hover:scale-105 transition-transform shadow-xl"
+                  >
+                    <LogOut className="w-8 h-8" />
+                    LEAVE ROOM
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => initGame('single')}
+                  className="flex items-center gap-4 px-12 py-6 bg-white text-black rounded-full font-black italic text-2xl hover:scale-105 transition-transform shadow-xl"
+                >
+                  <RotateCcw className="w-8 h-8" />
+                  RESTART
+                </button>
+              )}
               <button 
                 onClick={() => resetToMenu(gameMode === 'multi')}
                 className="w-full py-4 bg-zinc-900 border-2 border-zinc-800 rounded-2xl text-zinc-500 font-black italic hover:text-white transition-all mt-4"

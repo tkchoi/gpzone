@@ -9,6 +9,8 @@ export enum PieceType {
 export enum Team {
   RED = 'RED',
   BLUE = 'BLUE',
+  YELLOW = 'YELLOW',
+  BLACK = 'BLACK',
   NEUTRAL = 'NEUTRAL',
 }
 
@@ -65,6 +67,9 @@ export interface Entity {
   pushVelocity: Position;
   lastHitTime: number;
   lastDamagedBy?: string;
+  color?: string;
+  baseColor?: string;
+  playerIndex?: number;
 }
 
 export interface Particle {
@@ -90,6 +95,7 @@ export interface DamageText {
 export interface GameState {
   player: Entity;
   remotePlayers: { [id: string]: Entity };
+  playerScores?: Record<string, number>;
   allies: Entity[];
   enemies: Entity[];
   particles: Particle[];

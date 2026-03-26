@@ -54,6 +54,8 @@ enum PieceType {
 enum Team {
   RED = "RED",
   BLUE = "BLUE",
+  YELLOW = "YELLOW",
+  BLACK = "BLACK",
   NEUTRAL = "NEUTRAL",
 }
 
@@ -91,10 +93,14 @@ type Entity = {
   pushVelocity: Position;
   lastHitTime: number;
   lastDamagedBy?: string;
+  color?: string;
+  baseColor?: string;
+  playerIndex?: number;
 };
 
 type InputState = {
   seq: number;
+  roundId?: number;
   clientTime: number;
   moveX: number;
   moveY: number;
@@ -107,7 +113,9 @@ type RoomState = {
   hostId: string;
   matchType: "coop" | "versus";
   players: Record<string, Entity>;
+  playerScores: Record<string, number>;
   inputs: Record<string, InputState>;
+  inputQueues: Record<string, InputState[]>;
   allies: Entity[];
   enemies: Entity[];
   playerHistory: Record<string, Array<{ time: number; pos: Position }>>;
@@ -116,7 +124,8 @@ type RoomState = {
   gameOver: boolean;
   gameWon: boolean;
   screenShake: number;
-  status: "lobby" | "playing";
+  status: "lobby" | "playing" | "gameover";
+  roundId: number;
   loop: NodeJS.Timeout | null;
 };
 
@@ -133,6 +142,13 @@ const INITIAL_WALLS: Wall[] = [
   { x: 700, y: 900, width: 200, height: 200 },
 ];
 
+const PLAYER_COLORS = [
+  { top: "#3b82f6", base: "#1e3a8a", team: Team.BLUE }, // Blue
+  { top: "#ef4444", base: "#7f1d1d", team: Team.RED },  // Red
+  { top: "#eab308", base: "#854d0e", team: Team.YELLOW }, // Yellow
+  { top: "#3f3f46", base: "#09090b", team: Team.BLACK }, // Black
+];
+
 const rooms: Record<string, RoomState> = {};
 
 function randomId(prefix: string) {
@@ -144,35 +160,35 @@ function clamp(value: number, min: number, max: number) {
 }
 
 function createPlayer(socketId: string, index: number, total: number, matchType: "coop" | "versus"): Entity {
-  let spawn = { x: MAP_WIDTH / 2, y: MAP_HEIGHT - 220 };
-  let facingAngle = -Math.PI / 2;
+  const spawnPoints = [
+    { x: MAP_WIDTH / 2, y: MAP_HEIGHT - 220, facingAngle: -Math.PI / 2 },
+    { x: MAP_WIDTH / 2, y: 220, facingAngle: Math.PI / 2 },
+    { x: 220, y: MAP_HEIGHT / 2, facingAngle: 0 },
+    { x: MAP_WIDTH - 220, y: MAP_HEIGHT / 2, facingAngle: Math.PI },
+  ];
 
-  if (matchType === "versus") {
-    const spawnPoints = [
-      { x: MAP_WIDTH / 2, y: MAP_HEIGHT - 220, facingAngle: -Math.PI / 2 },
-      { x: MAP_WIDTH / 2, y: 220, facingAngle: Math.PI / 2 },
-      { x: 220, y: MAP_HEIGHT / 2, facingAngle: 0 },
-      { x: MAP_WIDTH - 220, y: MAP_HEIGHT / 2, facingAngle: Math.PI },
-    ];
-    const selected = spawnPoints[index] ?? spawnPoints[index % spawnPoints.length];
-    spawn = { x: selected.x, y: selected.y };
-    facingAngle = selected.facingAngle;
-  } else {
-    const spacing = 120;
-    const formationWidth = spacing * Math.max(total - 1, 0);
-    const startX = MAP_WIDTH / 2 - formationWidth / 2;
-    spawn = { x: startX + spacing * index, y: MAP_HEIGHT - 220 };
+  const selected = spawnPoints[index] ?? spawnPoints[index % spawnPoints.length];
+  let spawn = { x: selected.x, y: selected.y };
+  let facingAngle = selected.facingAngle;
+
+  if (matchType !== "versus" && total <= 1) {
+    // Single player or first player in coop often defaults to bottom
+    spawn = { x: MAP_WIDTH / 2, y: MAP_HEIGHT - 220 };
+    facingAngle = -Math.PI / 2;
   }
+
+  const colorData = PLAYER_COLORS[index % PLAYER_COLORS.length];
+  const team = colorData.team;
 
   return {
     id: socketId,
     type: PieceType.KING,
-    team: Team.BLUE,
+    team,
     ownerId: socketId,
     pos: spawn,
     hp: 300,
     maxHp: 300,
-    speed: 5,
+    speed: 10,
     radius: 24,
     attackRange: 90,
     attackDamage: 40,
@@ -185,6 +201,9 @@ function createPlayer(socketId: string, index: number, total: number, matchType:
     pushVelocity: { x: 0, y: 0 },
     lastHitTime: 0,
     lastProcessedInputSeq: 0,
+    color: colorData.top,
+    baseColor: colorData.base,
+    playerIndex: index,
   };
 }
 
@@ -479,130 +498,155 @@ function updatePlayers(room: RoomState, now: number) {
       continue;
     }
 
-    const input = room.inputs[socketId] || { seq: 0, clientTime: now, moveX: 0, moveY: 0, attack: false, skill: false };
-    player.lastProcessedInputSeq = input.seq;
-    const magnitude = Math.hypot(input.moveX, input.moveY);
-    const moveX = magnitude > 0 ? input.moveX / magnitude : 0;
-    const moveY = magnitude > 0 ? input.moveY / magnitude : 0;
+    const queue = room.inputQueues[socketId] || [];
+    
+    if (queue.length === 0) {
+      // Apply physics even with no input
+      player.pos.x += player.pushVelocity.x;
+      player.pos.y += player.pushVelocity.y;
+      player.pushVelocity.x *= 0.8;
+      player.pushVelocity.y *= 0.8;
+      resolveWallCollision(player, room.walls);
+      applyMapBounds(player);
+    } else {
+      // Process all pending inputs
+      while (queue.length > 0) {
+        const input = queue.shift()!;
+        if (input.seq <= player.lastProcessedInputSeq) continue;
+        
+        player.lastProcessedInputSeq = input.seq;
+        room.inputs[socketId] = input;
 
-    if (magnitude > 0) {
-      player.pos.x += moveX * player.speed;
-      player.pos.y += moveY * player.speed;
-      player.facingAngle = Math.atan2(moveY, moveX);
-    }
+        const magnitude = Math.hypot(input.moveX, input.moveY);
+        const moveX = magnitude > 0 ? input.moveX / magnitude : 0;
+        const moveY = magnitude > 0 ? input.moveY / magnitude : 0;
 
-    player.pos.x += player.pushVelocity.x;
-    player.pos.y += player.pushVelocity.y;
-    player.pushVelocity.x *= 0.8;
-    player.pushVelocity.y *= 0.8;
-
-    resolveWallCollision(player, room.walls);
-    applyMapBounds(player);
-
-    if (input.attack && now - player.lastAttackTime > player.attackCooldown) {
-      const attackSpread = Math.PI / 1.5;
-      const targets = isVersusRoom(room)
-        ? getEnemyTargetsForOwner(room, socketId)
-        : room.enemies;
-      const lagCompMs = clamp(now - input.clientTime, 0, 150);
-      const attackOrigin = isVersusRoom(room)
-        ? getHistoricalPlayerPosition(room, socketId, now - lagCompMs)
-        : player.pos;
-      for (const enemy of targets) {
-        const targetPos = isVersusRoom(room) && enemy.ownerId
-          ? getHistoricalPlayerPosition(room, enemy.ownerId, now - lagCompMs)
-          : enemy.pos;
-        const dx = targetPos.x - attackOrigin.x;
-        const dy = targetPos.y - attackOrigin.y;
-        const dist = Math.hypot(dx, dy);
-        if (dist > player.attackRange + enemy.radius) continue;
-
-        let angleDiff = Math.abs(Math.atan2(dy, dx) - player.facingAngle);
-        while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
-        angleDiff = Math.abs(angleDiff);
-
-        if (angleDiff <= attackSpread / 2) {
-          enemy.hp -= player.attackDamage;
-          enemy.lastHitTime = now;
-          enemy.lastDamagedBy = socketId;
-          enemy.pushVelocity.x = Math.cos(Math.atan2(dy, dx)) * 10;
-          enemy.pushVelocity.y = Math.sin(Math.atan2(dy, dx)) * 10;
-        }
-      }
-      player.lastAttackTime = now;
-    }
-
-    if (input.skill && now - player.lastSkillTime > player.skillCooldown) {
-      player.lastSkillTime = now;
-      room.screenShake = 25;
-      player.pushVelocity.x = Math.cos(player.facingAngle) * 45;
-      player.pushVelocity.y = Math.sin(player.facingAngle) * 45;
-      const lagCompMs = clamp(now - input.clientTime, 0, 150);
-      const skillOrigin = isVersusRoom(room)
-        ? getHistoricalPlayerPosition(room, socketId, now - lagCompMs)
-        : player.pos;
-
-      if (isVersusRoom(room)) {
-        const hostilePlayers = Object.values(room.players).filter(
-          (targetPlayer) => targetPlayer.ownerId !== socketId && !targetPlayer.isDead,
-        );
-        for (const targetPlayer of hostilePlayers) {
-          const targetPos = getHistoricalPlayerPosition(room, targetPlayer.ownerId ?? targetPlayer.id, now - lagCompMs);
-          const dist = Math.hypot(targetPos.x - skillOrigin.x, targetPos.y - skillOrigin.y);
-          if (dist < 300) {
-            targetPlayer.hp -= 180;
-            targetPlayer.lastHitTime = now;
-            targetPlayer.lastDamagedBy = socketId;
-          }
+        if (magnitude > 0) {
+          player.pos.x += moveX * player.speed;
+          player.pos.y += moveY * player.speed;
+          player.facingAngle = Math.atan2(moveY, moveX);
         }
 
-        for (let i = room.allies.length - 1; i >= 0; i -= 1) {
-          const enemyUnit = room.allies[i];
-          const dist = Math.hypot(enemyUnit.pos.x - skillOrigin.x, enemyUnit.pos.y - skillOrigin.y);
-          if (dist >= 300 || enemyUnit.ownerId === socketId) continue;
-          enemyUnit.ownerId = socketId;
-          enemyUnit.lastDamagedBy = socketId;
-        }
-      }
+        player.pos.x += player.pushVelocity.x;
+        player.pos.y += player.pushVelocity.y;
+        player.pushVelocity.x *= 0.8;
+        player.pushVelocity.y *= 0.8;
 
-      for (let i = room.enemies.length - 1; i >= 0; i -= 1) {
-        const enemy = room.enemies[i];
-        const dist = Math.hypot(enemy.pos.x - skillOrigin.x, enemy.pos.y - skillOrigin.y);
-        if (dist >= 300) continue;
+        resolveWallCollision(player, room.walls);
+        applyMapBounds(player);
 
-        if (enemy.id === "boss") {
-          enemy.hp -= 300;
-          enemy.lastHitTime = now;
-          enemy.lastDamagedBy = socketId;
-          continue;
+        // Process attack and skill per input
+        if (input.attack && now - player.lastAttackTime > player.attackCooldown) {
+          processPlayerAttack(room, socketId, player, input, now);
+          player.lastAttackTime = now;
         }
 
-        enemy.team = Team.BLUE;
-        enemy.ownerId = socketId;
-        enemy.hp = enemy.maxHp;
-        room.allies.push({
-          ...enemy,
-          id: randomId("ally"),
-          pushVelocity: { x: 0, y: 0 },
-          lastAttackTime: 0,
-        });
-        room.enemies.splice(i, 1);
+        if (input.skill && now - player.lastSkillTime > player.skillCooldown) {
+          processPlayerSkill(room, socketId, player, input, now);
+          player.lastSkillTime = now;
+        }
       }
     }
   }
 }
 
+function processPlayerAttack(room: RoomState, socketId: string, player: Entity, input: InputState, now: number) {
+  const attackSpread = Math.PI / 1.5;
+  const targets = isVersusRoom(room) ? getEnemyTargetsForOwner(room, socketId) : room.enemies;
+  const lagCompMs = clamp(now - input.clientTime, 0, 150);
+  const attackOrigin = isVersusRoom(room) ? getHistoricalPlayerPosition(room, socketId, now - lagCompMs) : player.pos;
+
+  for (const enemy of targets) {
+    const targetPos = isVersusRoom(room) && enemy.ownerId ? getHistoricalPlayerPosition(room, enemy.ownerId, now - lagCompMs) : enemy.pos;
+    const dx = targetPos.x - attackOrigin.x;
+    const dy = targetPos.y - attackOrigin.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist > player.attackRange + enemy.radius) continue;
+
+    let angleDiff = Math.abs(Math.atan2(dy, dx) - player.facingAngle);
+    while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+    angleDiff = Math.abs(angleDiff);
+
+    if (angleDiff <= attackSpread / 2) {
+      enemy.hp -= player.attackDamage;
+      enemy.lastHitTime = now;
+      enemy.lastDamagedBy = socketId;
+      enemy.pushVelocity.x = Math.cos(Math.atan2(dy, dx)) * 10;
+      enemy.pushVelocity.y = Math.sin(Math.atan2(dy, dx)) * 10;
+    }
+  }
+}
+
+function processPlayerSkill(room: RoomState, socketId: string, player: Entity, input: InputState, now: number) {
+  room.screenShake = 25;
+  player.pushVelocity.x = Math.cos(player.facingAngle) * 45;
+  player.pushVelocity.y = Math.sin(player.facingAngle) * 45;
+  const lagCompMs = clamp(now - input.clientTime, 0, 150);
+  const skillOrigin = isVersusRoom(room) ? getHistoricalPlayerPosition(room, socketId, now - lagCompMs) : player.pos;
+
+  if (isVersusRoom(room)) {
+    const hostilePlayers = Object.values(room.players).filter((targetPlayer) => targetPlayer.ownerId !== socketId && !targetPlayer.isDead);
+    for (const targetPlayer of hostilePlayers) {
+      const targetPos = getHistoricalPlayerPosition(room, targetPlayer.ownerId ?? targetPlayer.id, now - lagCompMs);
+      const dist = Math.hypot(targetPos.x - skillOrigin.x, targetPos.y - skillOrigin.y);
+      if (dist < 300) {
+        targetPlayer.hp -= 180;
+        targetPlayer.lastHitTime = now;
+        targetPlayer.lastDamagedBy = socketId;
+      }
+    }
+
+    for (let i = room.allies.length - 1; i >= 0; i -= 1) {
+      const enemyUnit = room.allies[i];
+      const dist = Math.hypot(enemyUnit.pos.x - skillOrigin.x, enemyUnit.pos.y - skillOrigin.y);
+      if (dist >= 300 || enemyUnit.ownerId === socketId) continue;
+      enemyUnit.ownerId = socketId;
+      enemyUnit.lastDamagedBy = socketId;
+    }
+  }
+
+  for (let i = room.enemies.length - 1; i >= 0; i -= 1) {
+    const enemy = room.enemies[i];
+    const dist = Math.hypot(enemy.pos.x - skillOrigin.x, enemy.pos.y - skillOrigin.y);
+    if (dist >= 300) continue;
+
+    if (enemy.id === "boss") {
+      enemy.hp -= 300;
+      enemy.lastHitTime = now;
+      enemy.lastDamagedBy = socketId;
+      continue;
+    }
+
+    enemy.team = Team.BLUE;
+    enemy.ownerId = socketId;
+    enemy.hp = enemy.maxHp;
+    room.allies.push({
+      ...enemy,
+      id: randomId("ally"),
+      pushVelocity: { x: 0, y: 0 },
+      lastAttackTime: 0,
+    });
+    room.enemies.splice(i, 1);
+  }
+}
 function cleanupUnits(room: RoomState) {
   for (const player of Object.values(room.players)) {
-    if (player.hp <= 0) {
+    if (player.hp <= 0 && !player.isDead) {
       player.hp = 0;
       player.isDead = true;
+      if (player.lastDamagedBy && room.players[player.lastDamagedBy]) {
+        room.playerScores[player.lastDamagedBy] = (room.playerScores[player.lastDamagedBy] || 0) + 1000;
+      }
     }
   }
 
   for (let i = room.enemies.length - 1; i >= 0; i -= 1) {
     const enemy = room.enemies[i];
     if (enemy.hp > 0) continue;
+
+    if (enemy.lastDamagedBy && room.players[enemy.lastDamagedBy]) {
+      room.playerScores[enemy.lastDamagedBy] = (room.playerScores[enemy.lastDamagedBy] || 0) + (enemy.type === PieceType.KING ? 500 : 100);
+    }
 
     if (enemy.id === "boss") {
       room.gameWon = true;
@@ -668,19 +712,8 @@ function buildSnapshotForSocket(room: RoomState, socketId: string) {
   const localPlayer = room.players[socketId];
   const players = Object.fromEntries(
     Object.entries(room.players).map(([id, player]) => {
-      if (!isVersusRoom(room) || id === socketId) {
-        return [id, { ...player, team: Team.BLUE }];
-      }
-
-      return [
-        id,
-        {
-          ...player,
-          type: PieceType.KING,
-          team: Team.RED,
-          radius: 35,
-        },
-      ];
+      // Keep original appearance (color, radius, type) and team
+      return [id, { ...player }];
     }),
   );
 
@@ -702,6 +735,7 @@ function buildSnapshotForSocket(room: RoomState, socketId: string) {
   const aliveOpponents = Object.values(room.players).filter(
     (player) => player.ownerId !== socketId && player.hp > 0 && !player.isDead,
   ).length;
+
   const gameOver = isVersusRoom(room)
     ? Boolean(localPlayer && (localPlayer.hp <= 0 || localPlayer.isDead))
     : room.gameOver;
@@ -711,6 +745,7 @@ function buildSnapshotForSocket(room: RoomState, socketId: string) {
 
   return {
     players,
+    playerScores: room.playerScores,
     allies,
     enemies,
     walls: room.walls,
@@ -721,6 +756,7 @@ function buildSnapshotForSocket(room: RoomState, socketId: string) {
     status: room.status,
     matchType: room.matchType,
     serverTime: Date.now(),
+    roundId: room.roundId,
   };
 }
 
@@ -732,7 +768,8 @@ function emitGameState(room: RoomState) {
 
 function emitRoomUpdate(room: RoomState) {
   io.to(room.code).emit("room-update", {
-    players: Object.keys(room.players),
+    code: room.code,
+    players: Object.entries(room.players).map(([id, p]) => ({ id, color: p.color })),
     hostId: room.hostId,
     status: room.status,
     matchType: room.matchType,
@@ -755,9 +792,6 @@ function destroyRoom(code: string) {
 
 function tickRoom(room: RoomState) {
   if (room.status !== "playing" || room.gameOver || room.gameWon) {
-    if (room.status === "playing") {
-      emitGameState(room);
-    }
     return;
   }
 
@@ -792,12 +826,21 @@ function tickRoom(room: RoomState) {
   }
 
   recordPlayerHistory(room, now + 1);
+  if (room.gameOver || room.gameWon) {
+    room.status = "gameover";
+    stopRoomLoop(room);
+    emitRoomUpdate(room);
+    emitGameState(room);
+    return;
+  }
+
   emitGameState(room);
 }
 
 function initializeRoomGame(room: RoomState) {
   stopRoomLoop(room);
   room.status = "playing";
+  room.roundId += 1;
   room.score = 0;
   room.gameOver = false;
   room.gameWon = false;
@@ -806,11 +849,20 @@ function initializeRoomGame(room: RoomState) {
   room.allies = [];
   room.enemies = room.matchType === "coop" ? [createBoss()] : [];
   room.playerHistory = {};
+  room.playerScores = Object.fromEntries(Object.keys(room.players).map(id => [id, 0]));
 
-  const playerIds = Object.keys(room.players);
+  const otherPlayerIds = Object.keys(room.players).filter((id) => id !== room.hostId);
+  const sortedPlayerIds = [room.hostId, ...otherPlayerIds];
   room.players = Object.fromEntries(
-    playerIds.map((id, index) => [id, createPlayer(id, index, playerIds.length, room.matchType)]),
+    sortedPlayerIds.map((id, index) => [id, createPlayer(id, index, sortedPlayerIds.length, room.matchType)]),
   );
+  room.inputs = Object.fromEntries(
+    sortedPlayerIds.map((id) => [
+      id,
+      { seq: 0, roundId: room.roundId, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false },
+    ]),
+  );
+  room.inputQueues = Object.fromEntries(sortedPlayerIds.map((id) => [id, []]));
   recordPlayerHistory(room, Date.now());
 
   for (let i = 0; i < 20; i += 1) {
@@ -818,7 +870,7 @@ function initializeRoomGame(room: RoomState) {
   }
 
   room.loop = setInterval(() => tickRoom(room), TICK_RATE);
-  io.to(room.code).emit("game-started");
+  io.to(room.code).emit("game-started", { roundId: room.roundId });
   emitRoomUpdate(room);
   emitGameState(room);
 }
@@ -829,7 +881,9 @@ function createRoom(code: string, socketId: string, matchType: "coop" | "versus"
     hostId: socketId,
     matchType,
     players: { [socketId]: createPlayer(socketId, 0, 1, matchType) },
-    inputs: { [socketId]: { seq: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false } },
+    playerScores: { [socketId]: 0 },
+    inputs: { [socketId]: { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false } },
+    inputQueues: { [socketId]: [] },
     allies: [],
     enemies: [],
     playerHistory: {},
@@ -839,6 +893,7 @@ function createRoom(code: string, socketId: string, matchType: "coop" | "versus"
     gameWon: false,
     screenShake: 0,
     status: "lobby",
+    roundId: 0,
     loop: null,
   };
 }
@@ -848,7 +903,9 @@ function detachSocketFromRooms(socketId: string) {
     if (!room.players[socketId]) continue;
 
     delete room.players[socketId];
+    delete room.playerScores[socketId];
     delete room.inputs[socketId];
+    delete room.inputQueues[socketId];
 
     if (room.hostId === socketId) {
       const nextHost = Object.keys(room.players)[0];
@@ -907,7 +964,9 @@ io.on("connection", (socket) => {
       Object.keys(room.players).length + 1,
       room.matchType,
     );
-    room.inputs[socket.id] = { seq: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
+    room.playerScores[socket.id] = 0;
+    room.inputs[socket.id] = { seq: 0, roundId: room.roundId, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
+    room.inputQueues[socket.id] = [];
     socket.join(upperCode);
     socket.emit("room-joined", upperCode);
     emitRoomUpdate(room);
@@ -930,19 +989,35 @@ io.on("connection", (socket) => {
     initializeRoomGame(room);
   });
 
+  socket.on("retry-game", (code: string) => {
+    const room = rooms[code];
+    if (!room) return;
+    if (room.hostId !== socket.id) return;
+    initializeRoomGame(room);
+  });
+
   socket.on("player-input", (data: { roomCode: string; input: InputState }) => {
     const room = rooms[data.roomCode];
     if (!room || room.status !== "playing" || !room.inputs[socket.id]) return;
+    if ((data.input.roundId ?? -1) !== room.roundId) return;
     const currentSeq = room.inputs[socket.id].seq;
     if (typeof data.input.seq !== "number" || data.input.seq < currentSeq) return;
-    room.inputs[socket.id] = {
+    
+    const newInput = {
       seq: data.input.seq,
+      roundId: room.roundId,
       clientTime: typeof data.input.clientTime === "number" ? data.input.clientTime : Date.now(),
       moveX: clamp(data.input.moveX, -1, 1),
       moveY: clamp(data.input.moveY, -1, 1),
       attack: Boolean(data.input.attack),
       skill: Boolean(data.input.skill),
     };
+
+    room.inputQueues[socket.id].push(newInput);
+    // Keep queue manageable
+    if (room.inputQueues[socket.id].length > 60) {
+      room.inputQueues[socket.id] = room.inputQueues[socket.id].slice(-60);
+    }
   });
 
   socket.on("disconnecting", () => {
