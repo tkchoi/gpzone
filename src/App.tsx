@@ -1412,11 +1412,13 @@ export default function App() {
         ctx.restore();
       }
 
-      if (now - entity.lastSkillTime < 550) {
-        const progress = (now - entity.lastSkillTime) / 550;
+      const skillElapsed = now - entity.lastSkillTime;
+      if (skillElapsed >= 0 && skillElapsed < 550) {
+        const progress = skillElapsed / 550;
         const alpha = Math.max(0, 1 - progress);
+        const skillRadius = Math.max(0, (isBoss ? 320 : 300) * progress);
         ctx.beginPath();
-        ctx.arc(entity.pos.x, entity.pos.y, (isBoss ? 320 : 300) * progress, 0, Math.PI * 2);
+        ctx.arc(entity.pos.x, entity.pos.y, skillRadius, 0, Math.PI * 2);
         ctx.strokeStyle = isBoss
           ? `rgba(239, 68, 68, ${alpha})`
           : `rgba(59, 130, 246, ${alpha})`;
