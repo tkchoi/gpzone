@@ -9,6 +9,26 @@ export enum PieceType {
 export enum Team {
   RED = 'RED',
   BLUE = 'BLUE',
+  NEUTRAL = 'NEUTRAL',
+}
+
+export interface PlayerInfo {
+  id: string;
+  name: string;
+  team: Team;
+  pos: Position;
+  hp: number;
+  maxHp: number;
+  facingAngle: number;
+  isDead: boolean;
+}
+
+export interface MultiplayerState {
+  players: { [id: string]: PlayerInfo };
+  minions: Entity[];
+  roomCode: string;
+  isHost: boolean;
+  status: 'lobby' | 'playing';
 }
 
 export interface Position {
@@ -66,6 +86,7 @@ export interface DamageText {
 
 export interface GameState {
   player: Entity;
+  remotePlayers: { [id: string]: Entity };
   allies: Entity[];
   enemies: Entity[];
   particles: Particle[];

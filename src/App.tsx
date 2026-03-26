@@ -1,9 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
-// Version: 1.0.1 - Force GitHub Sync (Color & Speed Fixes)
+// Version: 1.1.0 - Multiplayer Support
 import { motion, AnimatePresence } from 'motion/react';
-import { Sword, Zap, Skull, Play, Trophy, ShieldAlert, Pause, RotateCcw } from 'lucide-react';
+import { Sword, Zap, Skull, Play, Trophy, ShieldAlert, Pause, RotateCcw, Users, UserPlus, LogIn, Copy, Check } from 'lucide-react';
 import { PieceType, Team, Entity, Particle, DamageText, GameState, Wall } from './types';
 import { soundManager } from './SoundManager';
+import { io, Socket } from 'socket.io-client';
 
 const CANVAS_WIDTH = 800;
 const CANVAS_HEIGHT = 600;
@@ -42,6 +43,19 @@ export default function App() {
   const [isMobile, setIsMobile] = useState(false);
   const [canvasSize, setCanvasSize] = useState({ width: 800, height: 600 });
   
+  // Multiplayer States
+  const [gameMode, setGameMode] = useState<'single' | 'multi' | null>(null);
+  const [multiState, setMultiState] = useState<{
+    roomCode: string;
+    isHost: boolean;
+    players: string[];
+    status: 'lobby' | 'playing';
+    error: string;
+  }>({ roomCode: '', isHost: false, players: [], status: 'lobby', error: '' });
+  const [joinCode, setJoinCode] = useState('');
+  const [copied, setCopied] = useState(false);
+  const socketRef = useRef<Socket | null>(null);
+
   const isPlayingRef = useRef(false);
   const isPausedRef = useRef(false);
   const totalPausedTimeRef = useRef(0);
@@ -51,7 +65,7 @@ export default function App() {
   const accumulatorRef = useRef<number>(0);
   const TIME_STEP = 1000 / 60; // 60 FPS fixed timestep
 
-  const initGame = () => {
+  const initGame = (mode: 'single' | 'multi' = 'single') => {
     keysPressed.current.clear();
     joystickRef.current = { x: 0, y: 0 };
     setJoystick({ active: false, x: 0, y: 0, startX: 0, startY: 0 });
@@ -75,14 +89,19 @@ export default function App() {
     };
 
     gameStateRef.current = {
-      player, allies: [], enemies: [boss], particles: [], damageTexts: [], walls: INITIAL_WALLS,
+      player, remotePlayers: {}, allies: [], enemies: [boss], particles: [], damageTexts: [], walls: INITIAL_WALLS,
       score: 0, gameOver: false, gameWon: false, screenShake: 0,
     };
     
     // Initial guards
-    for(let i=0; i<8; i++) spawnEnemy(PieceType.PAWN);
-    for(let i=0; i<4; i++) spawnEnemy(PieceType.KNIGHT);
-    for(let i=0; i<2; i++) spawnEnemy(PieceType.ROOK);
+    if (mode === 'single') {
+      for(let i=0; i<8; i++) spawnEnemy(PieceType.PAWN);
+      for(let i=0; i<4; i++) spawnEnemy(PieceType.KNIGHT);
+      for(let i=0; i<2; i++) spawnEnemy(PieceType.ROOK);
+    } else {
+      // Multiplayer: Spawn neutral minions
+      for(let i=0; i<20; i++) spawnNeutralMinion();
+    }
 
     setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
     
@@ -114,6 +133,27 @@ export default function App() {
     }
   };
 
+  const spawnNeutralMinion = () => {
+    const state = gameStateRef.current;
+    if (!state) return;
+    
+    const x = 100 + Math.random() * (MAP_WIDTH - 200);
+    const y = 100 + Math.random() * (MAP_HEIGHT - 200);
+    
+    const minion: Entity = {
+      id: 'neutral-' + Math.random().toString(36).substr(2, 9),
+      type: PieceType.PAWN,
+      team: Team.NEUTRAL,
+      pos: { x, y },
+      hp: 40, maxHp: 40, speed: 2.5, radius: 18,
+      attackRange: 50, attackDamage: 10, attackCooldown: 1000, lastAttackTime: 0,
+      skillCooldown: 0, lastSkillTime: 0, isDead: false,
+      facingAngle: Math.random() * Math.PI * 2,
+      pushVelocity: { x: 0, y: 0 }, lastHitTime: 0,
+    };
+    state.enemies.push(minion);
+  };
+
   const spawnEnemy = (type: PieceType) => {
     const state = gameStateRef.current;
     if (!state) return;
@@ -129,13 +169,51 @@ export default function App() {
     if (type === PieceType.BISHOP) { speed = 2.5; hp = 60; attackDamage = 25; attackRange = 70; }
 
     state.enemies.push({
-      id: Math.random().toString(36).substring(2, 9),
-      type, team: Team.RED, pos: { x, y }, hp, maxHp: hp, speed, radius,
-      attackRange, attackDamage, attackCooldown: 1200, lastAttackTime: 0,
+      id: Math.random().toString(),
+      type,
+      team: Team.RED,
+      pos: { x, y },
+      hp, maxHp: hp, speed, radius,
+      attackRange, attackDamage, attackCooldown: 1000, lastAttackTime: 0,
       skillCooldown: 0, lastSkillTime: 0, isDead: false,
-      facingAngle: Math.PI / 2, pushVelocity: { x: 0, y: 0 }, lastHitTime: 0,
+      facingAngle: Math.PI / 2,
+      pushVelocity: { x: 0, y: 0 }, lastHitTime: 0,
     });
   };
+
+  const createRoom = () => {
+    socketRef.current?.emit('create-room');
+  };
+
+  const joinRoom = () => {
+    if (joinCode.trim()) {
+      socketRef.current?.emit('join-room', joinCode.trim());
+    }
+  };
+
+  const leaveRoom = () => {
+    socketRef.current?.emit('leave-room');
+    setGameMode(null);
+    setMultiState({
+      players: [],
+      roomCode: '',
+      isHost: false,
+      status: 'lobby',
+      error: null
+    });
+  };
+
+  const startGameMulti = () => {
+    socketRef.current?.emit('start-game', multiState.roomCode);
+  };
+
+  const copyRoomCode = () => {
+    const url = window.location.origin + '?room=' + multiState.roomCode;
+    navigator.clipboard.writeText(url);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
 
   const spawnParticles = (x: number, y: number, color: string, count: number) => {
     const state = gameStateRef.current;
@@ -494,7 +572,8 @@ export default function App() {
       enemy.pushVelocity.x *= 0.8;
       enemy.pushVelocity.y *= 0.8;
 
-      updateAI(enemy, [player, ...allies], now);
+      const potentialTargets = [player, ...allies, ...Object.values(state.remotePlayers)];
+      updateAI(enemy, potentialTargets, now);
       resolveWallCollision(enemy, walls);
 
       if (enemy.hp <= 0) {
@@ -536,6 +615,24 @@ export default function App() {
 
     if (state.screenShake > 0) state.screenShake *= 0.9;
     if (state.screenShake < 0.5) state.screenShake = 0;
+
+    // Multiplayer Sync
+    if (gameMode === 'multi' && socketRef.current?.id) {
+      socketRef.current.emit('sync-state', {
+        roomCode: multiState.roomCode,
+        state: {
+          id: socketRef.current.id,
+          pos: player.pos,
+          hp: player.hp,
+          maxHp: player.maxHp,
+          facingAngle: player.facingAngle,
+          isDead: player.isDead,
+          team: player.team,
+          type: player.type,
+          radius: player.radius
+        }
+      });
+    }
 
     if (player.hp <= 0) {
       state.gameOver = true;
@@ -583,9 +680,11 @@ export default function App() {
     const isHit = now - entity.lastHitTime < 100;
     const isBlue = entity.team === Team.BLUE;
     const isBoss = entity.type === PieceType.KING && entity.team === Team.RED;
+    const isNeutral = entity.team === Team.NEUTRAL;
+    const isRemote = entity.id.startsWith('remote-');
     
-    let baseColor = isHit ? '#ffffff' : (isBlue ? '#1e3a8a' : '#7f1d1d');
-    let topColor = isHit ? '#ffffff' : (isBlue ? '#3b82f6' : '#ef4444');
+    let baseColor = isHit ? '#ffffff' : (isNeutral ? '#d1d5db' : (isBlue ? (isRemote ? '#064e3b' : '#1e3a8a') : '#7f1d1d'));
+    let topColor = isHit ? '#ffffff' : (isNeutral ? '#ffffff' : (isBlue ? (isRemote ? '#10b981' : '#3b82f6') : '#ef4444'));
     
     if (isBoss) {
       baseColor = isHit ? '#ffffff' : '#450a0a';
@@ -619,6 +718,15 @@ export default function App() {
     ctx.arc(0, -height, entity.radius, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
+
+    // Player Label
+    const isLocalPlayer = entity.id === 'player';
+    if (isLocalPlayer || isRemote) {
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 12px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(isLocalPlayer ? 'YOU' : 'PLAYER', 0, -height - entity.radius - 5);
+    }
 
     // Visor/Face
     ctx.save();
@@ -667,7 +775,11 @@ export default function App() {
     ctx.fillRect(-barWidth/2 - 2, -barHeight/2 - 2, barWidth + 4, barHeight + 4);
     
     const fillPercent = Math.max(0, entity.hp / entity.maxHp);
-    ctx.fillStyle = isBlue ? '#22c55e' : (isBoss ? '#a855f7' : '#ef4444');
+    if (isNeutral) {
+      ctx.fillStyle = '#9ca3af';
+    } else {
+      ctx.fillStyle = isBlue ? '#22c55e' : (isBoss ? '#a855f7' : '#ef4444');
+    }
     ctx.fillRect(-barWidth/2, -barHeight/2, barWidth * fillPercent, barHeight);
     
     ctx.fillStyle = '#000000';
@@ -738,7 +850,7 @@ export default function App() {
     });
 
     // Sort entities by Y for fake 3D depth
-    const allEntities = [state.player, ...state.allies, ...state.enemies].sort((a, b) => a.pos.y - b.pos.y);
+    const allEntities = [state.player, ...Object.values(state.remotePlayers), ...state.allies, ...state.enemies].sort((a, b) => a.pos.y - b.pos.y);
     allEntities.forEach(e => drawEntity(ctx, e, now));
 
     // Attack Arc
@@ -794,6 +906,59 @@ export default function App() {
   };
 
   useEffect(() => {
+    // Check for room code in URL
+    const params = new URLSearchParams(window.location.search);
+    const roomFromUrl = params.get('room');
+    if (roomFromUrl) {
+      setJoinCode(roomFromUrl.toUpperCase());
+      setGameMode('multi');
+    }
+
+    // Initialize Socket
+    socketRef.current = io();
+
+    socketRef.current.on('room-created', (code) => {
+      setMultiState(prev => ({ ...prev, roomCode: code, isHost: true, status: 'lobby' }));
+    });
+
+    socketRef.current.on('room-joined', (code) => {
+      setMultiState(prev => ({ ...prev, roomCode: code, isHost: false, status: 'lobby' }));
+    });
+
+    socketRef.current.on('room-update', (data) => {
+      setMultiState(prev => ({ ...prev, players: data.players }));
+      if (gameStateRef.current) {
+        const currentRemoteIds = Object.keys(gameStateRef.current.remotePlayers);
+        currentRemoteIds.forEach(id => {
+          if (!data.players.includes(id)) {
+            delete gameStateRef.current.remotePlayers[id];
+          }
+        });
+      }
+    });
+
+    socketRef.current.on('game-started', () => {
+      setMultiState(prev => ({ ...prev, status: 'playing' }));
+      setIsPlaying(true);
+      initGame('multi');
+    });
+
+    socketRef.current.on('remote-sync', (data) => {
+      if (gameStateRef.current) {
+        gameStateRef.current.remotePlayers[data.id] = { ...data.state, id: 'remote-' + data.id };
+      }
+    });
+
+    socketRef.current.on('error-message', (msg) => {
+      setMultiState(prev => ({ ...prev, error: msg }));
+    });
+
+    return () => {
+      socketRef.current?.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
     const updateSize = () => {
       const mobile = 'ontouchstart' in window || navigator.maxTouchPoints > 0 || window.innerWidth < 1024;
       setIsMobile(mobile);
@@ -823,6 +988,7 @@ export default function App() {
     window.addEventListener('blur', handleBlur);
     
     return () => {
+      window.removeEventListener('resize', updateSize);
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('blur', handleBlur);
@@ -914,7 +1080,7 @@ export default function App() {
                 {isPaused ? <Play className="w-6 h-6" /> : <Pause className="w-6 h-6" />}
               </button>
               <button 
-                onClick={initGame} 
+                onClick={() => initGame(gameMode || 'single')} 
                 className="p-3 bg-zinc-900/80 rounded-2xl border-2 border-zinc-800 hover:bg-red-900/50 hover:border-red-800 text-white transition-colors"
                 title="Restart"
               >
@@ -927,13 +1093,162 @@ export default function App() {
 
       {/* Game Canvas Container */}
       <div className={isMobile ? "relative w-full h-full flex items-center justify-center bg-black" : "relative border-8 border-zinc-900 rounded-3xl overflow-hidden shadow-[0_0_50px_rgba(220,38,38,0.15)]"}>
+        {/* Mode Selection UI */}
+        {!isPlaying && !uiState.gameOver && !uiState.gameWon && (
+          <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/90 backdrop-blur-xl">
+            {!gameMode ? (
+              <div className="flex flex-col items-center gap-8 max-w-md w-full px-6">
+                <motion.div 
+                  initial={{ y: -20, opacity: 0 }}
+                  animate={{ y: 0, opacity: 1 }}
+                  className="text-center"
+                >
+                  <h1 className="text-6xl font-black italic text-white tracking-tighter mb-2">SHOGI <span className="text-red-600 underline decoration-8 underline-offset-8">ABYSS</span></h1>
+                  <p className="text-zinc-500 font-medium tracking-widest uppercase text-xs">Tactical Capture Combat</p>
+                </motion.div>
+
+                <div className="grid grid-cols-1 gap-4 w-full">
+                  <button 
+                    onClick={() => { setGameMode('single'); initGame('single'); }}
+                    className="group relative flex items-center justify-between p-6 bg-zinc-900 border-2 border-zinc-800 rounded-3xl hover:border-blue-500 transition-all overflow-hidden"
+                  >
+                    <div className="flex items-center gap-4">
+                      <div className="p-3 bg-blue-500/20 rounded-2xl group-hover:bg-blue-500/30 transition-colors">
+                        <Play className="w-6 h-6 text-blue-500" />
+                      </div>
+                      <div className="text-left">
+                        <h3 className="text-xl font-black text-white italic">SINGLE PLAYER</h3>
+                        <p className="text-xs text-zinc-500 font-bold">Defeat the Red King alone</p>
+                      </div>
+                    </div>
+                  </button>
+
+                  <button 
+                    onClick={() => setGameMode('multi')}
+                    className="group relative flex items-center justify-between p-6 bg-zinc-900 border-2 border-zinc-800 rounded-3xl hover:border-red-500 transition-all overflow-hidden"
+                  >
+                    <div className="flex items-center gap-4">
+                      <div className="p-3 bg-red-500/20 rounded-2xl group-hover:bg-red-500/30 transition-colors">
+                        <Users className="w-6 h-6 text-red-500" />
+                      </div>
+                      <div className="text-left">
+                        <h3 className="text-xl font-black text-white italic">MULTIPLAYER</h3>
+                        <p className="text-xs text-zinc-500 font-bold">Compete with other Kings</p>
+                      </div>
+                    </div>
+                  </button>
+                </div>
+              </div>
+            ) : gameMode === 'multi' && multiState.status === 'lobby' ? (
+              <div className="flex flex-col items-center gap-8 max-w-md w-full px-6">
+                <div className="text-center">
+                  <h2 className="text-4xl font-black italic text-white tracking-tighter mb-2">MULTIPLAYER <span className="text-red-600">LOBBY</span></h2>
+                  {multiState.roomCode && <p className="text-zinc-500 font-bold uppercase text-xs">Room: {multiState.roomCode}</p>}
+                </div>
+
+                {!multiState.roomCode ? (
+                  <div className="grid grid-cols-1 gap-4 w-full">
+                    <button 
+                      onClick={createRoom}
+                      className="flex items-center gap-4 p-6 bg-zinc-900 border-2 border-zinc-800 rounded-3xl hover:border-blue-500 transition-all"
+                    >
+                      <UserPlus className="w-6 h-6 text-blue-500" />
+                      <div className="text-left">
+                        <h3 className="text-xl font-black text-white italic">CREATE ROOM</h3>
+                        <p className="text-xs text-zinc-500 font-bold">Start a new battle</p>
+                      </div>
+                    </button>
+
+                    <div className="flex flex-col gap-2">
+                      <div className="relative">
+                        <input 
+                          type="text" 
+                          placeholder="ENTER ROOM CODE"
+                          value={joinCode}
+                          onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
+                          className="w-full p-6 bg-zinc-900 border-2 border-zinc-800 rounded-3xl text-white font-black italic focus:border-red-500 outline-none transition-all placeholder:text-zinc-700"
+                        />
+                        <button 
+                          onClick={joinRoom}
+                          className="absolute right-4 top-1/2 -translate-y-1/2 p-3 bg-red-600 rounded-2xl text-white hover:bg-red-500 transition-colors"
+                        >
+                          <LogIn className="w-6 h-6" />
+                        </button>
+                      </div>
+                      {multiState.error && <p className="text-red-500 text-[10px] font-black uppercase text-center">{multiState.error}</p>}
+                    </div>
+                    
+                    <button 
+                      onClick={() => setGameMode(null)}
+                      className="w-full p-4 bg-zinc-900 border-2 border-zinc-800 rounded-2xl text-zinc-500 font-black italic hover:text-white transition-all mt-4"
+                    >
+                      BACK TO MENU
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center gap-6 w-full">
+                    <div className="w-full p-6 bg-zinc-900 border-2 border-zinc-800 rounded-3xl flex flex-col items-center gap-4">
+                      <span className="text-zinc-500 font-black uppercase text-[10px] tracking-widest">Connected Players</span>
+                      <div className="flex flex-wrap justify-center gap-2">
+                        {multiState.players.map((id, idx) => (
+                          <div key={id} className="px-4 py-2 bg-zinc-800 rounded-xl border border-zinc-700 text-white font-black italic text-sm">
+                            PLAYER {idx + 1} {id === socketRef.current?.id ? '(YOU)' : ''}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="flex gap-2 w-full">
+                      <button 
+                        onClick={copyRoomCode}
+                        className="flex-1 flex items-center justify-center gap-2 p-4 bg-zinc-900 border-2 border-zinc-800 rounded-2xl text-zinc-400 font-black italic hover:text-white transition-all"
+                      >
+                        {copied ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
+                        {copied ? 'COPIED!' : 'COPY CODE'}
+                      </button>
+                      
+                      {multiState.isHost && (
+                        <button 
+                          onClick={startGameMulti}
+                          disabled={multiState.players.length < 2}
+                          className="flex-[2] p-4 bg-red-600 rounded-2xl text-white font-black italic hover:bg-red-500 transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-[0_0_30px_rgba(220,38,38,0.3)]"
+                        >
+                          START BATTLE
+                        </button>
+                      )}
+                    </div>
+                    
+                    {!multiState.isHost && (
+                      <p className="text-zinc-500 font-black italic animate-pulse">WAITING FOR HOST TO START...</p>
+                    )}
+
+                    <button 
+                      onClick={leaveRoom}
+                      className="w-full p-4 bg-zinc-900 border-2 border-zinc-800 rounded-2xl text-zinc-500 font-black italic hover:text-white transition-all mt-4"
+                    >
+                      LEAVE ROOM
+                    </button>
+                  </div>
+                )}
+
+                <button 
+                  onClick={() => { setGameMode(null); setMultiState(prev => ({ ...prev, roomCode: '', error: '' })); }}
+                  className="text-zinc-600 font-black uppercase text-[10px] tracking-widest hover:text-zinc-400 transition-colors"
+                >
+                  BACK TO MENU
+                </button>
+              </div>
+            ) : null}
+          </div>
+        )}
+
         <canvas
           ref={canvasRef}
           width={canvasSize.width}
           height={canvasSize.height}
           className={isMobile ? "w-full h-full block" : "bg-black block"}
           onClick={() => {
-            if (!isPlaying && !uiState.gameOver && !uiState.gameWon) initGame();
+            if (!isPlaying && !uiState.gameOver && !uiState.gameWon) initGame(gameMode || 'single');
             if (!isMobile) window.focus();
           }}
         />
@@ -1084,7 +1399,7 @@ export default function App() {
               </p>
               
               <button
-                onClick={initGame}
+                onClick={() => initGame(gameMode || 'single')}
                 className="group relative px-12 py-6 bg-red-600 hover:bg-red-500 transition-all rounded-full overflow-hidden shadow-[0_0_50px_rgba(220,38,38,0.3)]"
               >
                 <div className="relative z-10 flex items-center gap-4">
@@ -1109,6 +1424,12 @@ export default function App() {
                 className="px-12 py-5 bg-white text-black rounded-full font-black italic text-xl hover:scale-105 transition-transform"
               >
                 RESUME MISSION
+              </button>
+              <button 
+                onClick={() => { setIsPlaying(false); setGameMode(null); if(isPaused) togglePause(); }}
+                className="w-full py-4 bg-zinc-900 border-2 border-zinc-800 rounded-2xl text-zinc-500 font-black italic hover:text-white transition-all mt-4"
+              >
+                QUIT TO MENU
               </button>
             </div>
           </motion.div>
@@ -1149,11 +1470,17 @@ export default function App() {
               </div>
 
               <button
-                onClick={initGame}
+                onClick={() => initGame(gameMode || 'single')}
                 className="flex items-center gap-4 px-12 py-6 bg-white text-black rounded-full font-black italic text-2xl hover:scale-105 transition-transform shadow-xl"
               >
                 <RotateCcw className="w-8 h-8" />
                 REDEPLOY
+              </button>
+              <button 
+                onClick={() => { setIsPlaying(false); setGameMode(null); }}
+                className="w-full py-4 bg-zinc-900 border-2 border-zinc-800 rounded-2xl text-zinc-500 font-black italic hover:text-white transition-all mt-4"
+              >
+                BACK TO MENU
               </button>
             </motion.div>
           </motion.div>
