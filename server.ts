@@ -15,7 +15,7 @@ const io = new Server(httpServer, {
   },
 });
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
 const CANVAS_WIDTH = 800;
 const CANVAS_HEIGHT = 600;
 const MAP_WIDTH = 1600;

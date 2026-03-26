@@ -51,6 +51,7 @@ const INITIAL_WALLS: Wall[] = [
 ];
 
 export default function App() {
+  const socketUrl = import.meta.env.VITE_SOCKET_URL?.trim() || undefined;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
@@ -437,6 +438,10 @@ export default function App() {
   };
 
   const createRoom = () => {
+    if (!socketRef.current?.connected) {
+      setMultiState(prev => ({ ...prev, error: 'Server connection unavailable' }));
+      return;
+    }
     setMultiState(prev => ({ ...prev, error: '' }));
     socketRef.current?.emit('create-room', { matchType: 'versus' });
   };
@@ -468,6 +473,10 @@ export default function App() {
   const joinRoom = () => {
     const normalizedCode = normalizeJoinCode(joinCode);
     if (normalizedCode) {
+      if (!socketRef.current?.connected) {
+        setMultiState(prev => ({ ...prev, error: 'Server connection unavailable' }));
+        return;
+      }
       setMultiState(prev => ({ ...prev, error: '' }));
       setJoinCode(normalizedCode);
       socketRef.current?.emit('join-room', normalizedCode);
@@ -1196,13 +1205,23 @@ export default function App() {
     }
 
     // Initialize Socket
-    socketRef.current = io();
+    socketRef.current = io(socketUrl, {
+      transports: ['websocket', 'polling'],
+    });
 
     socketRef.current.on('connect', () => {
+      setMultiState(prev => ({ ...prev, error: '' }));
       if (pendingAutoJoinRef.current) {
         socketRef.current?.emit('join-room', pendingAutoJoinRef.current);
         pendingAutoJoinRef.current = '';
       }
+    });
+
+    socketRef.current.on('connect_error', () => {
+      setMultiState(prev => ({
+        ...prev,
+        error: socketUrl ? 'Realtime server unavailable' : 'Realtime server unavailable. Configure VITE_SOCKET_URL for deployment.'
+      }));
     });
 
     socketRef.current.on('room-created', (code) => {
@@ -1346,7 +1365,7 @@ export default function App() {
   };
 
   return (
-    <div className={isMobile ? "fixed inset-0 bg-[#050505] text-white font-sans flex flex-col items-center justify-center select-none overflow-hidden touch-none" : "min-h-screen bg-[#050505] text-white font-sans flex flex-col items-center justify-center p-4 select-none"}>
+    <div className={isMobile ? "fixed inset-0 bg-[#050505] text-white font-sans flex flex-col items-center justify-center select-none overflow-hidden" : "min-h-screen bg-[#050505] text-white font-sans flex flex-col items-center justify-center p-4 select-none"}>
       {/* Desktop Header */}
       {!isMobile && (
         <div className="w-full max-w-[800px] flex justify-between items-center mb-4 px-2">
