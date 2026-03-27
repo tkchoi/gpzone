@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 // Version: 1.1.0 - Multiplayer Support
 import { motion, AnimatePresence } from 'motion/react';
-import { Sword, Zap, Skull, Play, Trophy, ShieldAlert, Pause, RotateCcw, Users, UserPlus, LogIn, Copy, Check, LogOut } from 'lucide-react';
+import { Sword, Zap, Skull, Play, Trophy, ShieldAlert, Pause, RotateCcw, Users, UserPlus, LogIn, Copy, Check, LogOut, ChevronDown, ChevronUp } from 'lucide-react';
 import { PieceType, Team, Entity, Particle, DamageText, GameState, Wall } from './types';
 import { soundManager } from './SoundManager';
 import { io, Socket } from 'socket.io-client';
@@ -30,8 +30,9 @@ type MultiplayerSnapshot = {
   score: number;
   gameOver: boolean;
   gameWon: boolean;
+  paused: boolean;
   screenShake: number;
-  status: 'lobby' | 'playing';
+  status: 'lobby' | 'playing' | 'gameover';
   matchType: 'coop' | 'versus';
   serverTime: number;
   roundId: number;
@@ -67,6 +68,7 @@ export default function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [uiState, setUiState] = useState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
+  const [showRankingPanel, setShowRankingPanel] = useState(false);
   const requestRef = useRef<number>(null);
   const cameraRef = useRef({ x: 0, y: 0 });
   const attackReleaseTimeoutRef = useRef<number | null>(null);
@@ -171,6 +173,8 @@ export default function App() {
   };
 
   const applyPredictedMovement = (player: Entity, input: MultiplayerInputState, walls: Wall[]) => {
+    if (player.isDead) return;
+
     const magnitude = Math.hypot(input.moveX, input.moveY);
     if (magnitude > 0) {
       const moveX = input.moveX / magnitude;
@@ -189,18 +193,35 @@ export default function App() {
     applyLocalMapBounds(player);
   };
 
+  const applyGhostMovement = (player: Entity, input: MultiplayerInputState) => {
+    const magnitude = Math.hypot(input.moveX, input.moveY);
+    if (magnitude > 0) {
+      const moveX = input.moveX / magnitude;
+      const moveY = input.moveY / magnitude;
+      player.pos.x += moveX * player.speed;
+      player.pos.y += moveY * player.speed;
+      player.facingAngle = Math.atan2(moveY, moveX);
+    }
+
+    // Ghost ignores collision/pushback and only stays inside map bounds.
+    applyLocalMapBounds(player);
+  };
+
   const predictMultiplayerStep = () => {
     const state = gameStateRef.current;
     if (!state) return;
+    const isGhostMode = state.player.isDead;
 
     const sampledInput = {
       ...multiInputRef.current,
       seq: inputSeqRef.current + 1,
       roundId: roundIdRef.current,
-      clientTime: Date.now()
+      clientTime: Date.now(),
+      attack: isGhostMode ? false : multiInputRef.current.attack,
+      skill: isGhostMode ? false : multiInputRef.current.skill,
     };
-    inputSeqRef.current = sampledInput.seq;
     multiInputRef.current = sampledInput;
+    inputSeqRef.current = sampledInput.seq;
     pendingInputsRef.current.push(sampledInput);
     if (pendingInputsRef.current.length > 120) {
       pendingInputsRef.current = pendingInputsRef.current.slice(-120);
@@ -213,13 +234,20 @@ export default function App() {
       });
     }
 
-    applyPredictedMovement(state.player, sampledInput, state.walls);
+    if (isGhostMode) {
+      applyGhostMovement(state.player, sampledInput);
+    } else {
+      applyPredictedMovement(state.player, sampledInput, state.walls);
+    }
   };
 
   const syncMultiInput = (patch: Partial<MultiplayerInputState> = {}) => {
+    const isDeadInMultiplayer = gameModeRef.current === 'multi' && Boolean(gameStateRef.current?.player?.isDead);
     multiInputRef.current = {
       ...multiInputRef.current,
       ...patch,
+      attack: isDeadInMultiplayer ? false : (patch.attack ?? multiInputRef.current.attack),
+      skill: isDeadInMultiplayer ? false : (patch.skill ?? multiInputRef.current.skill),
     };
   };
 
@@ -236,6 +264,20 @@ export default function App() {
       window.clearTimeout(skillReleaseTimeoutRef.current);
       skillReleaseTimeoutRef.current = null;
     }
+  };
+
+  const applyPauseState = (nextPaused: boolean) => {
+    if (isPausedRef.current === nextPaused) return;
+    isPausedRef.current = nextPaused;
+    setIsPaused(nextPaused);
+
+    if (nextPaused) {
+      pauseStartTimeRef.current = Date.now();
+      return;
+    }
+
+    totalPausedTimeRef.current += Date.now() - pauseStartTimeRef.current;
+    lastTimeRef.current = performance.now();
   };
 
   const resetToMenu = (leaveMultiRoom = false) => {
@@ -284,6 +326,7 @@ export default function App() {
     setMultiScores({});
     gameStateRef.current = null;
     setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
+    setShowRankingPanel(false);
   };
 
   const applyMultiplayerSnapshot = (snapshot: MultiplayerSnapshot) => {
@@ -325,6 +368,8 @@ export default function App() {
       };
     }
 
+    applyPauseState(Boolean(snapshot.paused));
+
     const authoritativePlayer = { ...(snapshot.players[socketId] ?? createEmptyMultiplayerPlayer()), id: 'player' };
     const lastProcessedInputSeq = authoritativePlayer.lastProcessedInputSeq ?? 0;
     pendingInputsRef.current = pendingInputsRef.current.filter((input) => input.seq > lastProcessedInputSeq);
@@ -335,10 +380,15 @@ export default function App() {
       pushVelocity: { ...authoritativePlayer.pushVelocity },
     };
     for (const input of pendingInputsRef.current) {
-      applyPredictedMovement(replayedPlayer, input, snapshot.walls);
+      if (replayedPlayer.isDead) {
+        applyGhostMovement(replayedPlayer, input);
+      } else {
+        applyPredictedMovement(replayedPlayer, input, snapshot.walls);
+      }
     }
 
     const currentDisplayedPlayer = gameStateRef.current?.player;
+    const wasAliveBefore = Boolean(currentDisplayedPlayer && !currentDisplayedPlayer.isDead);
     const localPlayer = currentDisplayedPlayer
       ? {
           ...currentDisplayedPlayer,
@@ -361,6 +411,18 @@ export default function App() {
           lastProcessedInputSeq: replayedPlayer.lastProcessedInputSeq,
         }
       : replayedPlayer;
+
+    if (wasAliveBefore && localPlayer.isDead) {
+      clearTransientInputs();
+      pendingInputsRef.current = [];
+      multiInputRef.current = {
+        ...multiInputRef.current,
+        moveX: 0,
+        moveY: 0,
+        attack: false,
+        skill: false,
+      };
+    }
 
     if (currentDisplayedPlayer) {
       const dx = replayedPlayer.pos.x - currentDisplayedPlayer.pos.x;
@@ -736,6 +798,7 @@ export default function App() {
     for(let i=0; i<2; i++) spawnEnemy(PieceType.ROOK);
 
     setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
+    setShowRankingPanel(false);
     
     totalPausedTimeRef.current = 0;
     pauseStartTimeRef.current = 0;
@@ -752,18 +815,15 @@ export default function App() {
   };
 
   const togglePause = () => {
-    if (gameModeRef.current === 'multi') return;
     if (!isPlayingRef.current || gameStateRef.current?.gameOver || gameStateRef.current?.gameWon) return;
-    
-    isPausedRef.current = !isPausedRef.current;
-    setIsPaused(isPausedRef.current);
-    
-    if (isPausedRef.current) {
-      pauseStartTimeRef.current = Date.now();
-    } else {
-      totalPausedTimeRef.current += Date.now() - pauseStartTimeRef.current;
-      lastTimeRef.current = performance.now(); // Reset time to prevent huge delta
+
+    if (gameModeRef.current === 'multi') {
+      if (!roomCodeRef.current) return;
+      socketRef.current?.emit('toggle-pause', roomCodeRef.current);
+      return;
     }
+
+    applyPauseState(!isPausedRef.current);
   };
 
   const spawnNeutralMinion = () => {
@@ -892,6 +952,7 @@ export default function App() {
     multiOutcomeRef.current = { gameOver: false, gameWon: false };
     gameStateRef.current = null;
     setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
+    setShowRankingPanel(false);
     setMultiScores({});
     setGameMode(null);
     setJoinCode('');
@@ -935,6 +996,7 @@ export default function App() {
     multiOutcomeRef.current = { gameOver: false, gameWon: false };
     gameStateRef.current = null;
     setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
+    setShowRankingPanel(false);
     setMultiScores({});
     setGameMode('multi');
     setJoinCode('');
@@ -1490,6 +1552,64 @@ export default function App() {
     const isBoss = entity.type === PieceType.KING && entity.team === Team.RED && !entity.id.startsWith('remote-') && entity.id !== 'player';
     const isNeutral = entity.team === Team.NEUTRAL;
     const isRemote = entity.id.startsWith('remote-');
+    const isLocalPlayer = entity.id === 'player';
+    const isPlayerEntity = isLocalPlayer || isRemote;
+
+    if (entity.isDead && isPlayerEntity) {
+      const ghostBodyY = -entity.radius * 0.5;
+      const floatOffset = Math.sin(now / 220) * 3;
+
+      // Soft ghost shadow
+      ctx.fillStyle = 'rgba(147, 197, 253, 0.28)';
+      ctx.beginPath();
+      ctx.ellipse(0, entity.radius * 1.1, entity.radius * 0.95, entity.radius * 0.42, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.translate(0, floatOffset);
+      ctx.globalAlpha = 0.9;
+      const ghostGrad = ctx.createLinearGradient(0, -entity.radius * 2.5, 0, entity.radius * 1.4);
+      ghostGrad.addColorStop(0, '#e0f2fe');
+      ghostGrad.addColorStop(0.55, '#93c5fd');
+      ghostGrad.addColorStop(1, 'rgba(59,130,246,0.12)');
+
+      // Ghost body
+      ctx.fillStyle = ghostGrad;
+      ctx.strokeStyle = '#bfdbfe';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.moveTo(-entity.radius * 0.95, ghostBodyY + entity.radius * 1.25);
+      ctx.quadraticCurveTo(-entity.radius * 1.1, -entity.radius * 0.2, -entity.radius * 0.2, -entity.radius * 2.0);
+      ctx.quadraticCurveTo(0, -entity.radius * 2.35, entity.radius * 0.2, -entity.radius * 2.0);
+      ctx.quadraticCurveTo(entity.radius * 1.1, -entity.radius * 0.2, entity.radius * 0.95, ghostBodyY + entity.radius * 1.25);
+      ctx.lineTo(entity.radius * 0.55, ghostBodyY + entity.radius * 1.1);
+      ctx.lineTo(entity.radius * 0.2, ghostBodyY + entity.radius * 1.35);
+      ctx.lineTo(-entity.radius * 0.2, ghostBodyY + entity.radius * 1.1);
+      ctx.lineTo(-entity.radius * 0.55, ghostBodyY + entity.radius * 1.35);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+
+      // Eyes
+      ctx.fillStyle = '#0f172a';
+      ctx.beginPath();
+      ctx.arc(-entity.radius * 0.28, -entity.radius * 1.45, entity.radius * 0.11, 0, Math.PI * 2);
+      ctx.arc(entity.radius * 0.28, -entity.radius * 1.45, entity.radius * 0.11, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Local ghost label
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#dbeafe';
+      ctx.font = 'bold 12px sans-serif';
+      ctx.textAlign = 'center';
+      const baseLabel = entity.name?.trim()
+        ? entity.name.trim()
+        : (entity.playerIndex !== undefined ? `PLAYER ${entity.playerIndex + 1}` : 'PLAYER');
+      const ghostLabel = `${baseLabel}${isLocalPlayer ? ' (YOU)' : ''}`;
+      ctx.fillText(ghostLabel, 0, entity.radius * 2.35);
+
+      ctx.restore();
+      return;
+    }
 
     let baseColor = isHit ? '#ffffff' : (isNeutral ? '#d1d5db' : (isBlue ? (isRemote ? '#064e3b' : '#1e3a8a') : '#7f1d1d'));
     let topColor = isHit ? '#ffffff' : (isNeutral ? '#ffffff' : (isBlue ? (isRemote ? '#10b981' : '#3b82f6') : '#ef4444'));
@@ -1531,7 +1651,6 @@ export default function App() {
     ctx.stroke();
 
     // Player Label
-    const isLocalPlayer = entity.id === 'player';
     if (isLocalPlayer || isRemote) {
       ctx.fillStyle = '#ffffff';
       ctx.font = 'bold 12px sans-serif';
@@ -1846,6 +1965,11 @@ export default function App() {
       applyMultiplayerSnapshot(snapshot);
     });
 
+    socketRef.current.on('room-paused', (data: { code: string; paused: boolean }) => {
+      if (!data || data.code !== roomCodeRef.current) return;
+      applyPauseState(Boolean(data.paused));
+    });
+
     socketRef.current.on('error-message', (msg) => {
       setMultiState(prev => ({ ...prev, error: msg }));
     });
@@ -1990,6 +2114,7 @@ export default function App() {
   };
 
   const triggerAttack = () => {
+    if (gameModeRef.current === 'multi' && gameStateRef.current?.player?.isDead) return;
     keysPressed.current.add('z');
     syncMultiInput({ attack: true });
     if (attackReleaseTimeoutRef.current !== null) {
@@ -2003,6 +2128,7 @@ export default function App() {
   };
 
   const triggerSkill = () => {
+    if (gameModeRef.current === 'multi' && gameStateRef.current?.player?.isDead) return;
     keysPressed.current.add('x');
     syncMultiInput({ skill: true });
     if (skillReleaseTimeoutRef.current !== null) {
@@ -2014,6 +2140,53 @@ export default function App() {
       skillReleaseTimeoutRef.current = null;
     }, 100);
   };
+
+  const localSocketId = socketRef.current?.id;
+  const currentGameState = gameStateRef.current;
+  const shouldShowDesktopRanking =
+    !isMobile &&
+    isPlaying &&
+    gameMode === 'multi' &&
+    multiState.status === 'playing' &&
+    multiState.players.length > 0 &&
+    showRankingPanel;
+  const canToggleRankingPanel =
+    !isMobile &&
+    gameMode === 'multi' &&
+    multiState.status === 'playing';
+
+  const rankedPlayers = shouldShowDesktopRanking
+    ? multiState.players
+        .map((player, idx) => {
+          const entity = player.id === localSocketId
+            ? currentGameState?.player
+            : currentGameState?.remotePlayers[player.id];
+          const score = multiScores[player.id] || 0;
+          const hp = Math.max(0, Math.round(entity?.hp ?? 0));
+          const maxHp = Math.max(1, Math.round(entity?.maxHp ?? 300));
+          const isDead = Boolean(entity?.isDead);
+          const hpPercent = entity ? clamp(entity.hp / Math.max(1, entity.maxHp), 0, 1) : 0;
+
+          return {
+            id: player.id,
+            color: player.color,
+            score,
+            hp,
+            maxHp,
+            hpPercent,
+            isDead,
+            isLocal: player.id === localSocketId,
+            displayName: player.name?.trim() || `PLAYER ${idx + 1}`,
+          };
+        })
+        .sort((a, b) => {
+          if (b.score !== a.score) return b.score - a.score;
+          if (a.isDead !== b.isDead) return a.isDead ? 1 : -1;
+          if (b.hp !== a.hp) return b.hp - a.hp;
+          return a.displayName.localeCompare(b.displayName);
+        })
+        .map((entry, idx) => ({ ...entry, rank: idx + 1 }))
+    : [];
 
   return (
     <div className={isMobile ? "fixed inset-0 bg-[#050505] text-white font-sans flex flex-col items-center justify-center select-none overflow-hidden" : "min-h-screen bg-[#050505] text-white font-sans flex flex-col items-center justify-center p-4 select-none"}>
@@ -2049,9 +2222,9 @@ export default function App() {
             <div className="flex gap-2">
               <button 
                 onClick={togglePause} 
-                disabled={!isPlaying || uiState.gameOver || uiState.gameWon || gameMode === 'multi'}
+                disabled={!isPlaying || uiState.gameOver || uiState.gameWon}
                 className="p-3 bg-zinc-900/80 rounded-2xl border-2 border-zinc-800 hover:bg-zinc-800 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                title={gameMode === 'multi' ? 'Pause unavailable in multiplayer' : 'Pause (P or Esc)'}
+                title="Pause (P or Esc)"
               >
                 {isPaused ? <Play className="w-6 h-6" /> : <Pause className="w-6 h-6" />}
               </button>
@@ -2324,27 +2497,106 @@ export default function App() {
         {isPlaying && (
           <div className="absolute top-6 left-6 right-6 flex justify-between items-start pointer-events-none">
             <div className="flex flex-col gap-2">
-              <div className="flex flex-col">
-                {gameMode === 'multi' && gameStateRef.current?.player && (
-                  <div className="text-[10px] font-black italic text-white/60 tracking-widest uppercase -mb-1 ml-1">
-                    {`${gameStateRef.current.player.team} SCORE`}
+              <button
+                onClick={() => {
+                  if (canToggleRankingPanel) {
+                    setShowRankingPanel((prev) => !prev);
+                  }
+                }}
+                className={`flex flex-col text-left pointer-events-auto rounded-xl transition-colors ${
+                  canToggleRankingPanel
+                    ? 'cursor-pointer hover:bg-white/5 px-2 py-1 -ml-2 -mt-1'
+                    : 'cursor-default'
+                }`}
+                title={canToggleRankingPanel
+                  ? 'Toggle ranking panel'
+                  : undefined}
+                type="button"
+              >
+                {gameMode === 'multi' && (
+                  <div className="flex items-center gap-2 text-[10px] font-black italic text-white/65 tracking-widest uppercase -mb-1 ml-1">
+                    <span>{`${gameStateRef.current?.player?.team ?? 'TEAM'} SCORE`}</span>
+                    {canToggleRankingPanel && (
+                      <>
+                        <span className="text-white/35">|</span>
+                        <span className="text-white/60">RANKING</span>
+                        {showRankingPanel ? (
+                          <ChevronUp className="w-3.5 h-3.5 text-white/70" />
+                        ) : (
+                          <ChevronDown className="w-3.5 h-3.5 text-white/70" />
+                        )}
+                      </>
+                    )}
                   </div>
                 )}
                 <div className="text-4xl font-black italic tracking-tighter text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.8)]">
                   {uiState.score.toLocaleString()}
                 </div>
-              </div>
+              </button>
               <div className="flex items-center gap-2 bg-blue-900/40 px-3 py-1 rounded-full border border-blue-500/30 backdrop-blur-md">
                 <Skull className="w-4 h-4 text-blue-400" />
                 <span className="text-xs font-black text-blue-100 uppercase tracking-widest">
                   {uiState.allyCount}
                 </span>
               </div>
+
+              {shouldShowDesktopRanking && (
+                <motion.div
+                  layout
+                  className="mt-2 w-[340px] bg-black/55 border border-white/15 rounded-2xl backdrop-blur-md p-3"
+                >
+                  <div className="flex items-center justify-between mb-2 px-1">
+                    <span className="text-[10px] uppercase tracking-[0.24em] text-white/70 font-black">Ranking</span>
+                    <span className="text-[10px] uppercase tracking-[0.24em] text-white/50 font-black">Score / HP</span>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    {rankedPlayers.map((entry) => (
+                      <motion.div
+                        key={entry.id}
+                        layout
+                        transition={{ type: 'spring', stiffness: 330, damping: 30 }}
+                        className={`rounded-xl border px-3 py-2 ${
+                          entry.isLocal
+                            ? 'bg-blue-500/15 border-blue-400/45'
+                            : 'bg-zinc-900/70 border-white/10'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <div className="w-6 h-6 rounded-md bg-black/40 border border-white/20 text-[11px] font-black flex items-center justify-center">
+                              {entry.rank}
+                            </div>
+                            <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: entry.color }} />
+                            <span className="text-xs font-black tracking-wide truncate">
+                              {entry.displayName}{entry.isLocal ? ' (YOU)' : ''}
+                            </span>
+                          </div>
+                          <div className="text-sm font-black italic">{entry.score.toLocaleString()}</div>
+                        </div>
+
+                        <div className="mt-1.5 flex items-center gap-2">
+                          <span className={`text-[10px] font-black uppercase tracking-wider ${entry.isDead ? 'text-red-400' : 'text-emerald-300'}`}>
+                            {entry.isDead ? 'Dead' : 'Alive'}
+                          </span>
+                          <div className="flex-1 h-1.5 rounded-full bg-zinc-800 overflow-hidden">
+                            <div
+                              className={`h-full ${entry.isDead ? 'bg-red-500/70' : 'bg-emerald-400'}`}
+                              style={{ width: `${Math.round(entry.hpPercent * 100)}%` }}
+                            />
+                          </div>
+                          <span className="text-[10px] text-zinc-300 font-black tabular-nums">
+                            {entry.hp}/{entry.maxHp}
+                          </span>
+                        </div>
+                      </motion.div>
+                    ))}
+                  </div>
+                </motion.div>
+              )}
             </div>
             
             <button 
               onClick={togglePause}
-              disabled={gameMode === 'multi'}
               className="p-4 bg-white/10 hover:bg-white/20 rounded-2xl border border-white/20 backdrop-blur-md pointer-events-auto transition-colors shadow-xl"
             >
               {isPaused ? <Play className="w-6 h-6 fill-white" /> : <Pause className="w-6 h-6 fill-white" />}

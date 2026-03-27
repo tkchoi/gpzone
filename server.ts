@@ -125,6 +125,7 @@ type RoomState = {
   gameOver: boolean;
   gameWon: boolean;
   screenShake: number;
+  paused: boolean;
   status: "lobby" | "playing" | "gameover";
   roundId: number;
   loop: NodeJS.Timeout | null;
@@ -506,14 +507,40 @@ function updateAllies(room: RoomState, now: number) {
 
 function updatePlayers(room: RoomState, now: number) {
   for (const [socketId, player] of Object.entries(room.players)) {
+    const queue = room.inputQueues[socketId] || [];
+
     if (player.hp <= 0) {
       player.hp = 0;
       player.isDead = true;
+
+      // Dead players can move as ghosts (visual only): no collision/combat impact.
+      player.pushVelocity.x = 0;
+      player.pushVelocity.y = 0;
+      while (queue.length > 0) {
+        const input = queue.shift()!;
+        if (input.seq <= (player.lastProcessedInputSeq ?? 0)) continue;
+
+        player.lastProcessedInputSeq = input.seq;
+        room.inputs[socketId] = {
+          ...input,
+          attack: false,
+          skill: false,
+        };
+
+        const magnitude = Math.hypot(input.moveX, input.moveY);
+        if (magnitude > 0) {
+          const moveX = input.moveX / magnitude;
+          const moveY = input.moveY / magnitude;
+          player.pos.x += moveX * player.speed;
+          player.pos.y += moveY * player.speed;
+          player.facingAngle = Math.atan2(moveY, moveX);
+        }
+
+        applyMapBounds(player);
+      }
       continue;
     }
 
-    const queue = room.inputQueues[socketId] || [];
-    
     if (queue.length === 0) {
       // Apply physics even with no input
       player.pos.x += player.pushVelocity.x;
@@ -749,12 +776,14 @@ function buildSnapshotForSocket(room: RoomState, socketId: string) {
   const aliveOpponents = Object.values(room.players).filter(
     (player) => player.ownerId !== socketId && player.hp > 0 && !player.isDead,
   ).length;
+  const alivePlayers = Object.values(room.players).filter((player) => player.hp > 0 && !player.isDead).length;
+  const isRoundFinished = room.status === "gameover" || room.gameOver || room.gameWon;
 
   const gameOver = isVersusRoom(room)
-    ? Boolean(localPlayer && (localPlayer.hp <= 0 || localPlayer.isDead))
+    ? Boolean(isRoundFinished && localPlayer && (localPlayer.hp <= 0 || localPlayer.isDead))
     : room.gameOver;
   const gameWon = isVersusRoom(room)
-    ? Boolean(localPlayer && !gameOver && aliveOpponents === 0)
+    ? Boolean(isRoundFinished && localPlayer && aliveOpponents === 0 && alivePlayers > 0 && !gameOver)
     : room.gameWon;
 
   return {
@@ -767,6 +796,7 @@ function buildSnapshotForSocket(room: RoomState, socketId: string) {
     gameOver,
     gameWon,
     screenShake: room.screenShake,
+    paused: room.paused,
     status: room.status,
     matchType: room.matchType,
     serverTime: Date.now(),
@@ -806,6 +836,9 @@ function destroyRoom(code: string) {
 
 function tickRoom(room: RoomState) {
   if (room.status !== "playing" || room.gameOver || room.gameWon) {
+    return;
+  }
+  if (room.paused) {
     return;
   }
 
@@ -859,6 +892,7 @@ function initializeRoomGame(room: RoomState) {
   room.gameOver = false;
   room.gameWon = false;
   room.screenShake = 0;
+  room.paused = false;
   room.walls = INITIAL_WALLS.map((wall) => ({ ...wall }));
   room.allies = [];
   room.enemies = room.matchType === "coop" ? [createBoss()] : [];
@@ -907,6 +941,7 @@ function createRoom(code: string, socketId: string, matchType: "coop" | "versus"
     gameOver: false,
     gameWon: false,
     screenShake: 0,
+    paused: false,
     status: "lobby",
     roundId: 0,
     loop: null,
@@ -1017,6 +1052,17 @@ io.on("connection", (socket) => {
     if (!room) return;
     if (room.hostId !== socket.id) return;
     initializeRoomGame(room);
+  });
+
+  socket.on("toggle-pause", (code: string) => {
+    const room = rooms[code];
+    if (!room) return;
+    if (!room.players[socket.id]) return;
+    if (room.status !== "playing" || room.gameOver || room.gameWon) return;
+
+    room.paused = !room.paused;
+    io.to(room.code).emit("room-paused", { code: room.code, paused: room.paused, by: socket.id });
+    emitGameState(room);
   });
 
   socket.on("request-game-state", (code: string) => {
