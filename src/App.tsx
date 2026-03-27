@@ -36,7 +36,8 @@ type MultiplayerSnapshot = {
   paused: boolean;
   screenShake: number;
   status: 'lobby' | 'playing' | 'gameover';
-  matchType: 'coop' | 'versus';
+  matchType: 'coop' | 'versus' | 'timed';
+  timedEndsAt?: number | null;
   serverTime: number;
   roundId: number;
 };
@@ -88,12 +89,13 @@ export default function App() {
   
   // Multiplayer States
   const [gameMode, setGameMode] = useState<'single' | 'multi' | null>(null);
+  const [selectedMultiMode, setSelectedMultiMode] = useState<'versus' | 'timed'>('versus');
   const [multiState, setMultiState] = useState<{
     roomCode: string;
     isHost: boolean;
     players: { id: string; color: string; name?: string }[];
     status: 'lobby' | 'playing' | 'gameover';
-    matchType: 'coop' | 'versus';
+    matchType: 'coop' | 'versus' | 'timed';
     error: string;
   }>({ roomCode: '', isHost: false, players: [], status: 'lobby', matchType: 'versus', error: '' });
   const [multiScores, setMultiScores] = useState<Record<string, number>>({});
@@ -119,6 +121,7 @@ export default function App() {
   const enemyTargetsRef = useRef<Record<string, Entity>>({});
   const allyHistoryRef = useRef<Record<string, RemoteSnapshotSample[]>>({});
   const enemyHistoryRef = useRef<Record<string, RemoteSnapshotSample[]>>({});
+  const timedEndsAtRef = useRef<number | null>(null);
   const networkTimingRef = useRef({
     smoothedDelayMs: 80,
     jitterMs: 0,
@@ -213,15 +216,16 @@ export default function App() {
   const predictMultiplayerStep = () => {
     const state = gameStateRef.current;
     if (!state) return;
-    const isGhostMode = state.player.isDead;
+    const isDeadPlayer = state.player.isDead;
+    const isGhostMode = isDeadPlayer && multiState.matchType !== 'timed';
 
     const sampledInput = {
       ...multiInputRef.current,
       seq: inputSeqRef.current + 1,
       roundId: roundIdRef.current,
       clientTime: Date.now(),
-      attack: isGhostMode ? false : multiInputRef.current.attack,
-      skill: isGhostMode ? false : multiInputRef.current.skill,
+      attack: isDeadPlayer ? false : multiInputRef.current.attack,
+      skill: isDeadPlayer ? false : multiInputRef.current.skill,
     };
     multiInputRef.current = sampledInput;
     inputSeqRef.current = sampledInput.seq;
@@ -325,6 +329,7 @@ export default function App() {
     cameraRef.current = { x: 0, y: 0 };
     multiInputRef.current = { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
     multiOutcomeRef.current = { gameOver: false, gameWon: false };
+    timedEndsAtRef.current = null;
     setMultiState({ roomCode: '', isHost: false, players: [], status: 'lobby', matchType: 'versus', error: '' });
     setMultiScores({});
     gameStateRef.current = null;
@@ -337,6 +342,7 @@ export default function App() {
     if (!socketId) return;
     if (snapshot.roundId < roundIdRef.current) return;
     lastSnapshotAtRef.current = Date.now();
+    timedEndsAtRef.current = snapshot.timedEndsAt ?? null;
     setSyncRecovery(prev => (prev.active ? { active: false, retrying: false, message: '' } : prev));
     const localReceiveTime = Date.now();
     const observedDelay = Math.max(0, localReceiveTime - snapshot.serverTime);
@@ -883,7 +889,7 @@ export default function App() {
       return;
     }
     setMultiState(prev => ({ ...prev, error: '' }));
-    socketRef.current?.emit('create-room', { matchType: 'versus', playerName: playerNameInput.trim() });
+    socketRef.current?.emit('create-room', { matchType: selectedMultiMode, playerName: playerNameInput.trim() });
   };
 
   const normalizeJoinCode = (value: string) => {
@@ -953,6 +959,7 @@ export default function App() {
     attackFxTimesRef.current = {};
     multiInputRef.current = { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
     multiOutcomeRef.current = { gameOver: false, gameWon: false };
+    timedEndsAtRef.current = null;
     gameStateRef.current = null;
     setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
     setShowRankingPanel(false);
@@ -997,6 +1004,7 @@ export default function App() {
     syncRetryCountRef.current = 0;
     multiInputRef.current = { seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false };
     multiOutcomeRef.current = { gameOver: false, gameWon: false };
+    timedEndsAtRef.current = null;
     gameStateRef.current = null;
     setUiState({ score: 0, skillPercent: 0, gameOver: false, gameWon: false, allyCount: 0 });
     setShowRankingPanel(false);
@@ -1147,6 +1155,41 @@ export default function App() {
     });
   };
 
+  const separateEntityPair = (a: Entity, b: Entity) => {
+    if (a.isDead || b.isDead) return;
+    const dx = b.pos.x - a.pos.x;
+    const dy = b.pos.y - a.pos.y;
+    const dist = Math.hypot(dx, dy);
+    const minDist = a.radius + b.radius;
+    if (dist >= minDist) return;
+
+    const safeDist = dist < 0.0001 ? 0.0001 : dist;
+    const nx = dx / safeDist;
+    const ny = dy / safeDist;
+    const overlap = minDist - safeDist;
+    const pushEach = overlap * 0.35;
+
+    a.pos.x -= nx * pushEach;
+    a.pos.y -= ny * pushEach;
+    b.pos.x += nx * pushEach;
+    b.pos.y += ny * pushEach;
+  };
+
+  const resolveCharacterCollisionsSingle = (entities: Entity[], walls: Wall[]) => {
+    for (let i = 0; i < entities.length; i += 1) {
+      for (let j = i + 1; j < entities.length; j += 1) {
+        separateEntityPair(entities[i], entities[j]);
+      }
+    }
+
+    for (const entity of entities) {
+      resolveWallCollision(entity, walls);
+      const margin = 60 + entity.radius;
+      entity.pos.x = Math.max(margin, Math.min(MAP_WIDTH - margin, entity.pos.x));
+      entity.pos.y = Math.max(margin, Math.min(MAP_HEIGHT - margin, entity.pos.y));
+    }
+  };
+
   const updateAI = (entity: Entity, targets: Entity[], now: number) => {
     const isBoss = entity.id === 'boss';
     const state = gameStateRef.current!;
@@ -1216,7 +1259,7 @@ export default function App() {
       const angle = Math.atan2(target.pos.y - entity.pos.y, target.pos.x - entity.pos.x);
       
       // Aggressive Pursuit with Wall Avoidance
-      if (minDist > entity.attackRange - 20) {
+      if (minDist > entity.attackRange + target.radius - 20) {
         let moveAngle = angle;
         
         // Strafing
@@ -1283,7 +1326,7 @@ export default function App() {
       
       const angle = Math.atan2(targetPos.y - entity.pos.y, targetPos.x - entity.pos.x);
       
-      if (minDist > entity.attackRange - 10) {
+      if (minDist > entity.attackRange + closest.radius - 10) {
         let moveAngle = angle;
         
         entity.pos.x += Math.cos(moveAngle) * entity.speed;
@@ -1427,6 +1470,7 @@ export default function App() {
         }
 
         if (convertedCount > 0) {
+          state.score += convertedCount * 100;
           spawnDamageText(player.pos.x, player.pos.y - 60, `CONVERTED ${convertedCount}!`, '#3b82f6');
           soundManager.playCapture();
         }
@@ -1469,6 +1513,7 @@ export default function App() {
           state.gameWon = true;
           spawnParticles(enemy.pos.x, enemy.pos.y, '#fbbf24', 100);
         } else {
+          state.score += 100;
           if (enemy.lastDamagedBy === 'player' && enemy.lastDamageSource === 'attack') {
             // Normal attack corruption reward: +20 percentage points.
             player.lastSkillTime = Math.max(
@@ -1493,6 +1538,8 @@ export default function App() {
         enemies.splice(i, 1);
       }
     }
+
+    resolveCharacterCollisionsSingle([player, ...allies, ...enemies], walls);
 
     updateVisualEffects(state);
 
@@ -1568,6 +1615,57 @@ export default function App() {
     const isRemote = entity.id.startsWith('remote-');
     const isLocalPlayer = entity.id === 'player';
     const isPlayerEntity = isLocalPlayer || isRemote;
+    const isTimedDeadPlayer = isPlayerEntity && entity.isDead && multiState.matchType === 'timed';
+
+    if (isTimedDeadPlayer) {
+      const respawnMs = Math.max(0, (entity.respawnAt ?? 0) - Date.now());
+      const respawnCount = Math.max(1, Math.ceil(respawnMs / 1000));
+      const height = entity.radius * 1.5;
+
+      // Shadow
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.beginPath();
+      ctx.ellipse(0, entity.radius * 0.8, entity.radius, entity.radius * 0.5, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = '#111111';
+
+      // Grayed body
+      ctx.fillStyle = '#3f3f46';
+      ctx.beginPath();
+      ctx.arc(0, 0, entity.radius, 0, Math.PI);
+      ctx.lineTo(entity.radius, -height);
+      ctx.arc(0, -height, entity.radius, 0, Math.PI, true);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+
+      // Grayed head
+      ctx.fillStyle = '#71717a';
+      ctx.beginPath();
+      ctx.arc(0, -height, entity.radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      // Countdown in front of player
+      ctx.fillStyle = '#e4e4e7';
+      ctx.font = 'bold 24px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(String(respawnCount), 0, -height - entity.radius * 1.4);
+
+      // Player label
+      const baseLabel = entity.name?.trim()
+        ? entity.name.trim()
+        : (entity.playerIndex !== undefined ? `PLAYER ${entity.playerIndex + 1}` : 'PLAYER');
+      const label = `${baseLabel}${isLocalPlayer ? ' (YOU)' : ''}`;
+      ctx.fillStyle = '#d4d4d8';
+      ctx.font = 'bold 12px sans-serif';
+      ctx.fillText(label, 0, entity.radius * 2.1);
+
+      ctx.restore();
+      return;
+    }
 
     if (entity.isDead && isPlayerEntity) {
       const ghostBodyY = -entity.radius * 0.5;
@@ -2157,6 +2255,15 @@ export default function App() {
 
   const localSocketId = socketRef.current?.id;
   const currentGameState = gameStateRef.current;
+  const isTimedMatch = multiState.matchType === 'timed';
+  const timedRemainingMs = Math.max(0, (timedEndsAtRef.current ?? 0) - Date.now());
+  const timedRemainingSeconds = Math.ceil(timedRemainingMs / 1000);
+  const timedMinutes = Math.floor(timedRemainingSeconds / 60);
+  const timedSeconds = timedRemainingSeconds % 60;
+  const localRespawnMs = currentGameState?.player?.respawnAt
+    ? Math.max(0, currentGameState.player.respawnAt - Date.now())
+    : 0;
+  const localRespawnSeconds = Math.max(0, Math.ceil(localRespawnMs / 1000));
   const shouldShowDesktopRanking =
     !isMobile &&
     isPlaying &&
@@ -2313,11 +2420,35 @@ export default function App() {
                 <div className="text-center">
                   <h2 className="text-4xl font-black italic text-white tracking-tighter mb-2">MULTIPLAYER <span className="text-red-600">LOBBY</span></h2>
                   {multiState.roomCode && <p className="text-zinc-500 font-bold uppercase text-xs">Room: {multiState.roomCode}</p>}
-                  <p className="text-zinc-600 font-bold uppercase text-[10px] mt-2 tracking-[0.3em]">Versus Mode</p>
+                  <p className="text-zinc-600 font-bold uppercase text-[10px] mt-2 tracking-[0.3em]">
+                    {multiState.matchType === 'timed' ? 'Timed Mode (1:00)' : 'Versus Mode'}
+                  </p>
                 </div>
 
                 {!multiState.roomCode ? (
                   <div className="grid grid-cols-1 gap-4 w-full">
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        onClick={() => setSelectedMultiMode('versus')}
+                        className={`p-3 rounded-2xl border-2 text-xs font-black italic transition-all ${
+                          selectedMultiMode === 'versus'
+                            ? 'bg-red-600/20 border-red-500 text-white'
+                            : 'bg-zinc-900 border-zinc-800 text-zinc-400'
+                        }`}
+                      >
+                        VERSUS
+                      </button>
+                      <button
+                        onClick={() => setSelectedMultiMode('timed')}
+                        className={`p-3 rounded-2xl border-2 text-xs font-black italic transition-all ${
+                          selectedMultiMode === 'timed'
+                            ? 'bg-blue-600/20 border-blue-500 text-white'
+                            : 'bg-zinc-900 border-zinc-800 text-zinc-400'
+                        }`}
+                      >
+                        TIMED 1:00
+                      </button>
+                    </div>
                     <button 
                       onClick={createRoom}
                       className="flex items-center gap-4 p-6 bg-zinc-900 border-2 border-zinc-800 rounded-3xl hover:border-blue-500 transition-all"
@@ -2325,7 +2456,9 @@ export default function App() {
                       <UserPlus className="w-6 h-6 text-blue-500" />
                       <div className="text-left">
                         <h3 className="text-xl font-black text-white italic">CREATE ROOM</h3>
-                        <p className="text-xs text-zinc-500 font-bold">Start a versus battle</p>
+                        <p className="text-xs text-zinc-500 font-bold">
+                          {selectedMultiMode === 'timed' ? '1-minute score race (respawns on death)' : 'Start a versus battle'}
+                        </p>
                       </div>
                     </button>
 
@@ -2547,6 +2680,14 @@ export default function App() {
                   {uiState.score.toLocaleString()}
                 </div>
               </button>
+              {isTimedMatch && (
+                <div className="inline-flex items-center gap-2 bg-black/45 border border-white/20 rounded-full px-3 py-1.5 w-fit">
+                  <span className="text-[10px] uppercase tracking-widest text-white/70 font-black">Time Left</span>
+                  <span className="text-sm font-black text-white tabular-nums">
+                    {`${timedMinutes}:${timedSeconds.toString().padStart(2, '0')}`}
+                  </span>
+                </div>
+              )}
               <div className="flex items-center gap-2 bg-blue-900/40 px-3 py-1 rounded-full border border-blue-500/30 backdrop-blur-md">
                 <Skull className="w-4 h-4 text-blue-400" />
                 <span className="text-xs font-black text-blue-100 uppercase tracking-widest">
@@ -2615,6 +2756,15 @@ export default function App() {
             >
               {isPaused ? <Play className="w-6 h-6 fill-white" /> : <Pause className="w-6 h-6 fill-white" />}
             </button>
+          </div>
+        )}
+
+        {isTimedMatch && isPlaying && currentGameState?.player?.isDead && localRespawnSeconds > 0 && (
+          <div className="absolute inset-0 z-20 flex items-center justify-center pointer-events-none">
+            <div className="px-6 py-4 rounded-2xl bg-black/45 border border-white/20 text-center">
+              <div className="text-xs uppercase tracking-[0.25em] text-white/70 font-black">Respawning</div>
+              <div className="text-3xl font-black italic text-white tabular-nums mt-1">{localRespawnSeconds}</div>
+            </div>
           </div>
         )}
 

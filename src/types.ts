@@ -65,6 +65,8 @@ export interface Entity {
   isDead: boolean;
   facingAngle: number;
   pushVelocity: Position;
+  spawnPos?: Position;
+  respawnAt?: number | null;
   lastHitTime: number;
   lastDamagedBy?: string;
   lastDamageSource?: 'attack' | 'skill';

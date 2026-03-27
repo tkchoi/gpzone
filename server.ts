@@ -25,6 +25,8 @@ const TICK_RATE = 1000 / 30;
 const PLAYER_SKILL_COOLDOWN_MS = 50000; // 2% charge per second
 const SKILL_CHARGE_BONUS_PER_CORRUPT_MS = 10000; // 20% per corrupted minion
 const PLAYER_SKILL_RADIUS = 200;
+const TIMED_MODE_DURATION_MS = 60 * 1000;
+const TIMED_RESPAWN_DELAY_MS = 3000;
 const DIST_DIR = path.join(__dirname, "dist");
 const DIST_INDEX = path.join(DIST_DIR, "index.html");
 
@@ -94,6 +96,8 @@ type Entity = {
   isDead: boolean;
   facingAngle: number;
   pushVelocity: Position;
+  spawnPos?: Position;
+  respawnAt?: number | null;
   lastHitTime: number;
   lastDamagedBy?: string;
   lastDamageSource?: "attack" | "skill";
@@ -116,7 +120,7 @@ type InputState = {
 type RoomState = {
   code: string;
   hostId: string;
-  matchType: "coop" | "versus";
+  matchType: "coop" | "versus" | "timed";
   players: Record<string, Entity>;
   playerScores: Record<string, number>;
   inputs: Record<string, InputState>;
@@ -131,6 +135,7 @@ type RoomState = {
   screenShake: number;
   paused: boolean;
   status: "lobby" | "playing" | "gameover";
+  timedEndsAt: number | null;
   roundId: number;
   loop: NodeJS.Timeout | null;
 };
@@ -172,7 +177,7 @@ function sanitizePlayerName(name?: string): string | undefined {
   return trimmed.slice(0, 18);
 }
 
-function createPlayer(socketId: string, index: number, total: number, matchType: "coop" | "versus", name?: string): Entity {
+function createPlayer(socketId: string, index: number, total: number, matchType: "coop" | "versus" | "timed", name?: string): Entity {
   const spawnPoints = [
     { x: MAP_WIDTH / 2, y: MAP_HEIGHT - 220, facingAngle: -Math.PI / 2 },
     { x: MAP_WIDTH / 2, y: 220, facingAngle: Math.PI / 2 },
@@ -212,6 +217,8 @@ function createPlayer(socketId: string, index: number, total: number, matchType:
     isDead: false,
     facingAngle,
     pushVelocity: { x: 0, y: 0 },
+    spawnPos: { ...spawn },
+    respawnAt: null,
     lastHitTime: 0,
     lastProcessedInputSeq: 0,
     color: colorData.top,
@@ -270,7 +277,7 @@ function createNeutralMinion(): Entity {
 }
 
 function isVersusRoom(room: RoomState) {
-  return room.matchType === "versus";
+  return room.matchType !== "coop";
 }
 
 function getAllLivingPlayers(room: RoomState) {
@@ -351,6 +358,45 @@ function applyMapBounds(entity: Entity) {
   const margin = 60 + entity.radius;
   entity.pos.x = clamp(entity.pos.x, margin, MAP_WIDTH - margin);
   entity.pos.y = clamp(entity.pos.y, margin, MAP_HEIGHT - margin);
+}
+
+function separateEntityPair(a: Entity, b: Entity) {
+  if (a.isDead || b.isDead) return;
+  const dx = b.pos.x - a.pos.x;
+  const dy = b.pos.y - a.pos.y;
+  const dist = Math.hypot(dx, dy);
+  const minDist = a.radius + b.radius;
+  if (dist >= minDist) return;
+
+  const safeDist = dist < 0.0001 ? 0.0001 : dist;
+  const nx = dx / safeDist;
+  const ny = dy / safeDist;
+  const overlap = minDist - safeDist;
+  const pushEach = overlap * 0.35;
+
+  a.pos.x -= nx * pushEach;
+  a.pos.y -= ny * pushEach;
+  b.pos.x += nx * pushEach;
+  b.pos.y += ny * pushEach;
+}
+
+function resolveCharacterCollisions(room: RoomState) {
+  const entities = [
+    ...Object.values(room.players).filter((player) => !player.isDead),
+    ...room.allies.filter((ally) => !ally.isDead),
+    ...room.enemies.filter((enemy) => !enemy.isDead),
+  ];
+
+  for (let i = 0; i < entities.length; i += 1) {
+    for (let j = i + 1; j < entities.length; j += 1) {
+      separateEntityPair(entities[i], entities[j]);
+    }
+  }
+
+  for (const entity of entities) {
+    resolveWallCollision(entity, room.walls);
+    applyMapBounds(entity);
+  }
 }
 
 function liveBlueUnits(room: RoomState) {
@@ -446,7 +492,7 @@ function updateEnemyAI(room: RoomState, entity: Entity, now: number) {
       }
     }
 
-    if (minDist > entity.attackRange - 20) {
+    if (minDist > entity.attackRange + closest.radius - 20) {
       let vx = Math.cos(angle) * speed;
       let vy = Math.sin(angle) * speed;
       for (const wall of room.walls) {
@@ -470,7 +516,7 @@ function updateEnemyAI(room: RoomState, entity: Entity, now: number) {
     return;
   }
 
-  if (minDist > entity.attackRange - 10) {
+  if (minDist > entity.attackRange + closest.radius - 10) {
     entity.pos.x += Math.cos(angle) * entity.speed;
     entity.pos.y += Math.sin(angle) * entity.speed;
   } else if (now - entity.lastAttackTime > entity.attackCooldown) {
@@ -493,7 +539,7 @@ function updateAllies(room: RoomState, now: number) {
     if (closest) {
       const angle = Math.atan2(closest.pos.y - ally.pos.y, closest.pos.x - ally.pos.x);
       ally.facingAngle = angle;
-      if (minDist > ally.attackRange - 10) {
+      if (minDist > ally.attackRange + closest.radius - 10) {
         ally.pos.x += Math.cos(angle) * ally.speed;
         ally.pos.y += Math.sin(angle) * ally.speed;
       } else if (now - ally.lastAttackTime > ally.attackCooldown) {
@@ -514,9 +560,39 @@ function updatePlayers(room: RoomState, now: number) {
   for (const [socketId, player] of Object.entries(room.players)) {
     const queue = room.inputQueues[socketId] || [];
 
-    if (player.hp <= 0) {
+    if (player.hp <= 0 && !player.isDead) {
       player.hp = 0;
       player.isDead = true;
+      if (player.lastDamagedBy && room.players[player.lastDamagedBy]) {
+        room.playerScores[player.lastDamagedBy] = (room.playerScores[player.lastDamagedBy] || 0) + 1000;
+      }
+      if (room.matchType === "timed") {
+        player.respawnAt = now + TIMED_RESPAWN_DELAY_MS;
+        player.pushVelocity = { x: 0, y: 0 };
+        if (player.spawnPos) {
+          player.pos = { ...player.spawnPos };
+        }
+      }
+    }
+
+    if (player.isDead) {
+      player.hp = 0;
+      if (room.matchType === "timed") {
+        if (player.respawnAt && now >= player.respawnAt) {
+          player.isDead = false;
+          player.hp = player.maxHp;
+          player.respawnAt = null;
+          player.lastDamagedBy = undefined;
+          player.lastDamageSource = undefined;
+          player.pushVelocity = { x: 0, y: 0 };
+          if (player.spawnPos) {
+            player.pos = { ...player.spawnPos };
+          }
+          room.inputQueues[socketId] = [];
+          continue;
+        }
+        continue;
+      }
 
       // Dead players can move as ghosts (visual only): no collision/combat impact.
       player.pushVelocity.x = 0;
@@ -633,6 +709,7 @@ function processPlayerSkill(room: RoomState, socketId: string, player: Entity, i
   const skillOrigin = isVersusRoom(room) ? getHistoricalPlayerPosition(room, socketId, now - lagCompMs) : player.pos;
 
   if (isVersusRoom(room)) {
+    let convertedBySkill = 0;
     const hostilePlayers = Object.values(room.players).filter((targetPlayer) => targetPlayer.ownerId !== socketId && !targetPlayer.isDead);
     for (const targetPlayer of hostilePlayers) {
       const targetPos = getHistoricalPlayerPosition(room, targetPlayer.ownerId ?? targetPlayer.id, now - lagCompMs);
@@ -651,9 +728,17 @@ function processPlayerSkill(room: RoomState, socketId: string, player: Entity, i
       if (dist >= PLAYER_SKILL_RADIUS || enemyUnit.ownerId === socketId) continue;
       enemyUnit.ownerId = socketId;
       enemyUnit.lastDamagedBy = socketId;
+      if (enemyUnit.type !== PieceType.KING) {
+        convertedBySkill += 1;
+      }
+    }
+
+    if (convertedBySkill > 0) {
+      room.playerScores[socketId] = (room.playerScores[socketId] || 0) + convertedBySkill * 100;
     }
   }
 
+  let convertedNeutrals = 0;
   for (let i = room.enemies.length - 1; i >= 0; i -= 1) {
     const enemy = room.enemies[i];
     const dist = Math.hypot(enemy.pos.x - skillOrigin.x, enemy.pos.y - skillOrigin.y);
@@ -677,19 +762,16 @@ function processPlayerSkill(room: RoomState, socketId: string, player: Entity, i
       lastAttackTime: 0,
     });
     room.enemies.splice(i, 1);
-  }
-}
-function cleanupUnits(room: RoomState) {
-  for (const player of Object.values(room.players)) {
-    if (player.hp <= 0 && !player.isDead) {
-      player.hp = 0;
-      player.isDead = true;
-      if (player.lastDamagedBy && room.players[player.lastDamagedBy]) {
-        room.playerScores[player.lastDamagedBy] = (room.playerScores[player.lastDamagedBy] || 0) + 1000;
-      }
+    if (enemy.type !== PieceType.KING) {
+      convertedNeutrals += 1;
     }
   }
 
+  if (isVersusRoom(room) && convertedNeutrals > 0) {
+    room.playerScores[socketId] = (room.playerScores[socketId] || 0) + convertedNeutrals * 100;
+  }
+}
+function cleanupUnits(room: RoomState) {
   for (let i = room.enemies.length - 1; i >= 0; i -= 1) {
     const enemy = room.enemies[i];
     if (enemy.hp > 0) continue;
@@ -706,6 +788,7 @@ function cleanupUnits(room: RoomState) {
       if (isVersusRoom(room)) {
         const ownerId = enemy.lastDamagedBy;
         if (ownerId && room.players[ownerId]) {
+          room.playerScores[ownerId] = (room.playerScores[ownerId] || 0) + 100;
           if (enemy.type !== PieceType.KING && enemy.lastDamageSource === "attack") {
             const scorer = room.players[ownerId];
             scorer.lastSkillTime = Math.max(
@@ -795,12 +878,20 @@ function buildSnapshotForSocket(room: RoomState, socketId: string) {
   const alivePlayers = Object.values(room.players).filter((player) => player.hp > 0 && !player.isDead).length;
   const isRoundFinished = room.status === "gameover" || room.gameOver || room.gameWon;
 
-  const gameOver = isVersusRoom(room)
-    ? Boolean(isRoundFinished && localPlayer && (localPlayer.hp <= 0 || localPlayer.isDead))
-    : room.gameOver;
-  const gameWon = isVersusRoom(room)
-    ? Boolean(isRoundFinished && localPlayer && aliveOpponents === 0 && alivePlayers > 0 && !gameOver)
-    : room.gameWon;
+  const timedScores = room.playerScores;
+  const maxTimedScore = Math.max(0, ...Object.values(timedScores));
+  const localTimedScore = timedScores[socketId] ?? 0;
+  const isTimedWinner = localTimedScore === maxTimedScore;
+  const gameOver = room.matchType === "timed"
+    ? Boolean(isRoundFinished && !isTimedWinner)
+    : (isVersusRoom(room)
+      ? Boolean(isRoundFinished && localPlayer && (localPlayer.hp <= 0 || localPlayer.isDead))
+      : room.gameOver);
+  const gameWon = room.matchType === "timed"
+    ? Boolean(isRoundFinished && isTimedWinner)
+    : (isVersusRoom(room)
+      ? Boolean(isRoundFinished && localPlayer && aliveOpponents === 0 && alivePlayers > 0 && !gameOver)
+      : room.gameWon);
 
   return {
     players,
@@ -813,6 +904,7 @@ function buildSnapshotForSocket(room: RoomState, socketId: string) {
     gameWon,
     screenShake: room.screenShake,
     paused: room.paused,
+    timedEndsAt: room.timedEndsAt,
     status: room.status,
     matchType: room.matchType,
     serverTime: Date.now(),
@@ -859,6 +951,14 @@ function tickRoom(room: RoomState) {
   }
 
   const now = Date.now();
+  if (room.matchType === "timed" && room.timedEndsAt && now >= room.timedEndsAt) {
+    room.status = "gameover";
+    room.gameWon = true;
+    stopRoomLoop(room);
+    emitRoomUpdate(room);
+    emitGameState(room);
+    return;
+  }
   room.screenShake *= 0.9;
   if (room.screenShake < 0.5) room.screenShake = 0;
 
@@ -877,9 +977,11 @@ function tickRoom(room: RoomState) {
     applyMapBounds(enemy);
   }
 
+  resolveCharacterCollisions(room);
+
   cleanupUnits(room);
 
-  if (isVersusRoom(room)) {
+  if (isVersusRoom(room) && room.matchType !== "timed") {
     const alivePlayers = Object.values(room.players).filter((player) => player.hp > 0 && !player.isDead).length;
     if (alivePlayers <= 1) {
       room.gameWon = true;
@@ -909,6 +1011,7 @@ function initializeRoomGame(room: RoomState) {
   room.gameWon = false;
   room.screenShake = 0;
   room.paused = false;
+  room.timedEndsAt = room.matchType === "timed" ? Date.now() + TIMED_MODE_DURATION_MS : null;
   room.walls = INITIAL_WALLS.map((wall) => ({ ...wall }));
   room.allies = [];
   room.enemies = room.matchType === "coop" ? [createBoss()] : [];
@@ -940,7 +1043,7 @@ function initializeRoomGame(room: RoomState) {
   emitGameState(room);
 }
 
-function createRoom(code: string, socketId: string, matchType: "coop" | "versus"): RoomState {
+function createRoom(code: string, socketId: string, matchType: "coop" | "versus" | "timed"): RoomState {
   return {
     code,
     hostId: socketId,
@@ -959,6 +1062,7 @@ function createRoom(code: string, socketId: string, matchType: "coop" | "versus"
     screenShake: 0,
     paused: false,
     status: "lobby",
+    timedEndsAt: null,
     roundId: 0,
     loop: null,
   };
@@ -993,13 +1097,15 @@ function detachSocketFromRooms(socketId: string) {
 }
 
 io.on("connection", (socket) => {
-  socket.on("create-room", (payload?: { matchType?: "coop" | "versus"; playerName?: string }) => {
+  socket.on("create-room", (payload?: { matchType?: "coop" | "versus" | "timed"; playerName?: string }) => {
     for (const room of socket.rooms) {
       if (rooms[room]) socket.leave(room);
     }
     detachSocketFromRooms(socket.id);
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-    const room = createRoom(code, socket.id, payload?.matchType === "versus" ? "versus" : "coop");
+    const selectedMode = payload?.matchType;
+    const matchType = selectedMode === "versus" || selectedMode === "timed" ? selectedMode : "coop";
+    const room = createRoom(code, socket.id, matchType);
     room.players[socket.id].name = sanitizePlayerName(payload?.playerName);
     rooms[code] = room;
     socket.join(code);
