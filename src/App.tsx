@@ -161,7 +161,8 @@ export default function App() {
     attackCooldown: 400,
     lastAttackTime: 0,
     skillCooldown: PLAYER_SKILL_COOLDOWN_MS,
-    lastSkillTime: 0,
+    // Spawn with 50% skill charge.
+    lastSkillTime: Date.now() - PLAYER_SKILL_COOLDOWN_MS / 2,
     isDead: false,
     facingAngle: -Math.PI / 2,
     pushVelocity: { x: 0, y: 0 },
@@ -218,6 +219,7 @@ export default function App() {
     const state = gameStateRef.current;
     if (!state) return;
     const isDeadPlayer = state.player.isDead;
+    const isTimedRespawnWaiting = isDeadPlayer && multiMatchTypeRef.current === 'timed';
     const isGhostMode = isDeadPlayer && multiMatchTypeRef.current !== 'timed';
 
     const sampledInput = {
@@ -225,6 +227,8 @@ export default function App() {
       seq: inputSeqRef.current + 1,
       roundId: roundIdRef.current,
       clientTime: Date.now(),
+      moveX: isTimedRespawnWaiting ? 0 : multiInputRef.current.moveX,
+      moveY: isTimedRespawnWaiting ? 0 : multiInputRef.current.moveY,
       attack: isDeadPlayer ? false : multiInputRef.current.attack,
       skill: isDeadPlayer ? false : multiInputRef.current.skill,
     };
@@ -251,9 +255,12 @@ export default function App() {
 
   const syncMultiInput = (patch: Partial<MultiplayerInputState> = {}) => {
     const isDeadInMultiplayer = gameModeRef.current === 'multi' && Boolean(gameStateRef.current?.player?.isDead);
+    const isTimedRespawnWaiting = isDeadInMultiplayer && multiMatchTypeRef.current === 'timed';
     multiInputRef.current = {
       ...multiInputRef.current,
       ...patch,
+      moveX: isTimedRespawnWaiting ? 0 : (patch.moveX ?? multiInputRef.current.moveX),
+      moveY: isTimedRespawnWaiting ? 0 : (patch.moveY ?? multiInputRef.current.moveY),
       attack: isDeadInMultiplayer ? false : (patch.attack ?? multiInputRef.current.attack),
       skill: isDeadInMultiplayer ? false : (patch.skill ?? multiInputRef.current.skill),
     };
@@ -1397,7 +1404,14 @@ export default function App() {
     player.pos.y = Math.max(margin, Math.min(MAP_HEIGHT - margin, player.pos.y));
 
     // Player Attack (Z or J)
-    if (keysPressed.current.has('z') || keysPressed.current.has('Z') || keysPressed.current.has('j') || keysPressed.current.has('J')) {
+    if (
+      keysPressed.current.has('KeyZ')
+      || keysPressed.current.has('z')
+      || keysPressed.current.has('Z')
+      || keysPressed.current.has('ㅋ')
+      || keysPressed.current.has('j')
+      || keysPressed.current.has('J')
+    ) {
       if (now - player.lastAttackTime > player.attackCooldown) {
         player.lastAttackTime = now;
         soundManager.playSwing(); // Play swing sound even on miss
@@ -1430,7 +1444,14 @@ export default function App() {
     }
 
     // Player Skill (X or K) - Conversion Dash
-    if (keysPressed.current.has('x') || keysPressed.current.has('X') || keysPressed.current.has('k') || keysPressed.current.has('K')) {
+    if (
+      keysPressed.current.has('KeyX')
+      || keysPressed.current.has('x')
+      || keysPressed.current.has('X')
+      || keysPressed.current.has('ㅌ')
+      || keysPressed.current.has('k')
+      || keysPressed.current.has('K')
+    ) {
       if (now - player.lastSkillTime > player.skillCooldown) {
         player.lastSkillTime = now;
         state.screenShake = 25;
@@ -2144,8 +2165,20 @@ export default function App() {
         - (keysPressed.current.has('ArrowLeft') || keysPressed.current.has('a') || keysPressed.current.has('A') ? 1 : 0);
       const moveY = (keysPressed.current.has('ArrowDown') || keysPressed.current.has('s') || keysPressed.current.has('S') ? 1 : 0)
         - (keysPressed.current.has('ArrowUp') || keysPressed.current.has('w') || keysPressed.current.has('W') ? 1 : 0);
-      const attack = keysPressed.current.has('z') || keysPressed.current.has('Z') || keysPressed.current.has('j') || keysPressed.current.has('J');
-      const skill = keysPressed.current.has('x') || keysPressed.current.has('X') || keysPressed.current.has('k') || keysPressed.current.has('K');
+      const attack =
+        keysPressed.current.has('KeyZ')
+        || keysPressed.current.has('z')
+        || keysPressed.current.has('Z')
+        || keysPressed.current.has('ㅋ')
+        || keysPressed.current.has('j')
+        || keysPressed.current.has('J');
+      const skill =
+        keysPressed.current.has('KeyX')
+        || keysPressed.current.has('x')
+        || keysPressed.current.has('X')
+        || keysPressed.current.has('ㅌ')
+        || keysPressed.current.has('k')
+        || keysPressed.current.has('K');
       syncMultiInput({ moveX, moveY, attack, skill });
     };
 
@@ -2156,10 +2189,12 @@ export default function App() {
       if (e.key === 'Escape' || e.key.toLowerCase() === 'p') {
         togglePause();
       }
+      keysPressed.current.add(e.code);
       keysPressed.current.add(e.key);
       emitKeyboardInput();
     };
     const handleKeyUp = (e: KeyboardEvent) => {
+      keysPressed.current.delete(e.code);
       keysPressed.current.delete(e.key);
       emitKeyboardInput();
     };

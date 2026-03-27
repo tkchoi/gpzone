@@ -213,7 +213,8 @@ function createPlayer(socketId: string, index: number, total: number, matchType:
     attackCooldown: 400,
     lastAttackTime: 0,
     skillCooldown: PLAYER_SKILL_COOLDOWN_MS,
-    lastSkillTime: 0,
+    // Spawn with 50% skill charge.
+    lastSkillTime: Date.now() - PLAYER_SKILL_COOLDOWN_MS / 2,
     isDead: false,
     facingAngle,
     pushVelocity: { x: 0, y: 0 },
@@ -581,6 +582,8 @@ function updatePlayers(room: RoomState, now: number) {
         if (player.respawnAt && now >= player.respawnAt) {
           player.isDead = false;
           player.hp = player.maxHp;
+          // Respawn with 50% skill charge.
+          player.lastSkillTime = now - player.skillCooldown / 2;
           player.respawnAt = null;
           player.lastDamagedBy = undefined;
           player.lastDamageSource = undefined;
@@ -675,10 +678,15 @@ function processPlayerAttack(room: RoomState, socketId: string, player: Entity, 
   const attackSpread = Math.PI / 1.5;
   const targets = isVersusRoom(room) ? getEnemyTargetsForOwner(room, socketId) : room.enemies;
   const lagCompMs = clamp(now - input.clientTime, 0, 150);
-  const attackOrigin = isVersusRoom(room) ? getHistoricalPlayerPosition(room, socketId, now - lagCompMs) : player.pos;
+  // Attacker uses current authoritative position; targets may be rewound.
+  const attackOrigin = player.pos;
 
   for (const enemy of targets) {
-    const targetPos = isVersusRoom(room) && enemy.ownerId ? getHistoricalPlayerPosition(room, enemy.ownerId, now - lagCompMs) : enemy.pos;
+    // Apply lag compensation only to actual player targets, not allied minions.
+    const isPlayerTarget = Boolean(room.players[enemy.id]);
+    const targetPos = isVersusRoom(room) && isPlayerTarget
+      ? getHistoricalPlayerPosition(room, enemy.id, now - lagCompMs)
+      : enemy.pos;
     const dx = targetPos.x - attackOrigin.x;
     const dy = targetPos.y - attackOrigin.y;
     const dist = Math.hypot(dx, dy);
@@ -706,7 +714,8 @@ function processPlayerSkill(room: RoomState, socketId: string, player: Entity, i
   player.pushVelocity.x = Math.cos(player.facingAngle) * 45;
   player.pushVelocity.y = Math.sin(player.facingAngle) * 45;
   const lagCompMs = clamp(now - input.clientTime, 0, 150);
-  const skillOrigin = isVersusRoom(room) ? getHistoricalPlayerPosition(room, socketId, now - lagCompMs) : player.pos;
+  // Attacker uses current authoritative position; targets may be rewound.
+  const skillOrigin = player.pos;
 
   if (isVersusRoom(room)) {
     let convertedBySkill = 0;
@@ -728,6 +737,9 @@ function processPlayerSkill(room: RoomState, socketId: string, player: Entity, i
       if (dist >= PLAYER_SKILL_RADIUS || enemyUnit.ownerId === socketId) continue;
       enemyUnit.ownerId = socketId;
       enemyUnit.lastDamagedBy = socketId;
+      enemyUnit.hp = enemyUnit.maxHp;
+      enemyUnit.isDead = false;
+      enemyUnit.pushVelocity = { x: 0, y: 0 };
       if (enemyUnit.type !== PieceType.KING) {
         convertedBySkill += 1;
       }
