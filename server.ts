@@ -22,6 +22,9 @@ const CANVAS_HEIGHT = 600;
 const MAP_WIDTH = 1600;
 const MAP_HEIGHT = 1600;
 const TICK_RATE = 1000 / 30;
+const PLAYER_SKILL_COOLDOWN_MS = 50000; // 2% charge per second
+const SKILL_CHARGE_BONUS_PER_CORRUPT_MS = 10000; // 20% per corrupted minion
+const PLAYER_SKILL_RADIUS = 200;
 const DIST_DIR = path.join(__dirname, "dist");
 const DIST_INDEX = path.join(DIST_DIR, "index.html");
 
@@ -93,6 +96,7 @@ type Entity = {
   pushVelocity: Position;
   lastHitTime: number;
   lastDamagedBy?: string;
+  lastDamageSource?: "attack" | "skill";
   color?: string;
   baseColor?: string;
   playerIndex?: number;
@@ -203,7 +207,7 @@ function createPlayer(socketId: string, index: number, total: number, matchType:
     attackDamage: 40,
     attackCooldown: 400,
     lastAttackTime: 0,
-    skillCooldown: 4000,
+    skillCooldown: PLAYER_SKILL_COOLDOWN_MS,
     lastSkillTime: 0,
     isDead: false,
     facingAngle,
@@ -382,6 +386,7 @@ function performMeleeAttack(attacker: Entity, target: Entity, now: number) {
   target.hp -= attacker.attackDamage;
   target.lastHitTime = now;
   target.lastDamagedBy = attacker.ownerId;
+  target.lastDamageSource = "attack";
   const angle = Math.atan2(target.pos.y - attacker.pos.y, target.pos.x - attacker.pos.x);
   target.pushVelocity.x = Math.cos(angle) * 8;
   target.pushVelocity.y = Math.sin(angle) * 8;
@@ -584,7 +589,6 @@ function updatePlayers(room: RoomState, now: number) {
 
         if (input.skill && now - player.lastSkillTime > player.skillCooldown) {
           processPlayerSkill(room, socketId, player, input, now);
-          player.lastSkillTime = now;
         }
       }
     }
@@ -612,6 +616,7 @@ function processPlayerAttack(room: RoomState, socketId: string, player: Entity, 
       enemy.hp -= player.attackDamage;
       enemy.lastHitTime = now;
       enemy.lastDamagedBy = socketId;
+      enemy.lastDamageSource = "attack";
       enemy.pushVelocity.x = Math.cos(Math.atan2(dy, dx)) * 10;
       enemy.pushVelocity.y = Math.sin(Math.atan2(dy, dx)) * 10;
     }
@@ -619,6 +624,8 @@ function processPlayerAttack(room: RoomState, socketId: string, player: Entity, 
 }
 
 function processPlayerSkill(room: RoomState, socketId: string, player: Entity, input: InputState, now: number) {
+  // Skill charge consumed. 100% charge == 50s cooldown (2%/sec).
+  player.lastSkillTime = now;
   room.screenShake = 25;
   player.pushVelocity.x = Math.cos(player.facingAngle) * 45;
   player.pushVelocity.y = Math.sin(player.facingAngle) * 45;
@@ -630,17 +637,18 @@ function processPlayerSkill(room: RoomState, socketId: string, player: Entity, i
     for (const targetPlayer of hostilePlayers) {
       const targetPos = getHistoricalPlayerPosition(room, targetPlayer.ownerId ?? targetPlayer.id, now - lagCompMs);
       const dist = Math.hypot(targetPos.x - skillOrigin.x, targetPos.y - skillOrigin.y);
-      if (dist < 300) {
-        targetPlayer.hp -= 180;
+      if (dist < PLAYER_SKILL_RADIUS) {
+        targetPlayer.hp -= 100;
         targetPlayer.lastHitTime = now;
         targetPlayer.lastDamagedBy = socketId;
+        targetPlayer.lastDamageSource = "skill";
       }
     }
 
     for (let i = room.allies.length - 1; i >= 0; i -= 1) {
       const enemyUnit = room.allies[i];
       const dist = Math.hypot(enemyUnit.pos.x - skillOrigin.x, enemyUnit.pos.y - skillOrigin.y);
-      if (dist >= 300 || enemyUnit.ownerId === socketId) continue;
+      if (dist >= PLAYER_SKILL_RADIUS || enemyUnit.ownerId === socketId) continue;
       enemyUnit.ownerId = socketId;
       enemyUnit.lastDamagedBy = socketId;
     }
@@ -649,12 +657,13 @@ function processPlayerSkill(room: RoomState, socketId: string, player: Entity, i
   for (let i = room.enemies.length - 1; i >= 0; i -= 1) {
     const enemy = room.enemies[i];
     const dist = Math.hypot(enemy.pos.x - skillOrigin.x, enemy.pos.y - skillOrigin.y);
-    if (dist >= 300) continue;
+    if (dist >= PLAYER_SKILL_RADIUS) continue;
 
     if (enemy.id === "boss") {
-      enemy.hp -= 300;
+      enemy.hp -= 100;
       enemy.lastHitTime = now;
       enemy.lastDamagedBy = socketId;
+      enemy.lastDamageSource = "skill";
       continue;
     }
 
@@ -697,6 +706,13 @@ function cleanupUnits(room: RoomState) {
       if (isVersusRoom(room)) {
         const ownerId = enemy.lastDamagedBy;
         if (ownerId && room.players[ownerId]) {
+          if (enemy.type !== PieceType.KING && enemy.lastDamageSource === "attack") {
+            const scorer = room.players[ownerId];
+            scorer.lastSkillTime = Math.max(
+              Date.now() - scorer.skillCooldown,
+              scorer.lastSkillTime - SKILL_CHARGE_BONUS_PER_CORRUPT_MS,
+            );
+          }
           room.allies.push({
             ...enemy,
             id: randomId("ally"),
@@ -1012,6 +1028,11 @@ io.on("connection", (socket) => {
 
     if (room.status !== "lobby") {
       socket.emit("error-message", "Game already in progress");
+      return;
+    }
+
+    if (Object.keys(room.players).length >= 4) {
+      socket.emit("error-message", "Room is full (max 4 players)");
       return;
     }
 

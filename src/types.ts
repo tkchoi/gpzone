@@ -67,6 +67,7 @@ export interface Entity {
   pushVelocity: Position;
   lastHitTime: number;
   lastDamagedBy?: string;
+  lastDamageSource?: 'attack' | 'skill';
   color?: string;
   baseColor?: string;
   playerIndex?: number;

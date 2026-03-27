@@ -10,6 +10,9 @@ const CANVAS_WIDTH = 800;
 const CANVAS_HEIGHT = 600;
 const MAP_WIDTH = 1600;
 const MAP_HEIGHT = 1600;
+const PLAYER_SKILL_COOLDOWN_MS = 50000; // 2% charge per second
+const SKILL_CHARGE_BONUS_PER_CORRUPT_MS = 10000; // 20% per corrupted minion
+const PLAYER_SKILL_RADIUS = 200;
 
 type MultiplayerInputState = {
   seq: number;
@@ -153,7 +156,7 @@ export default function App() {
     attackDamage: 40,
     attackCooldown: 400,
     lastAttackTime: 0,
-    skillCooldown: 4000,
+    skillCooldown: PLAYER_SKILL_COOLDOWN_MS,
     lastSkillTime: 0,
     isDead: false,
     facingAngle: -Math.PI / 2,
@@ -1367,6 +1370,8 @@ export default function App() {
             if (angleDiff <= attackSpread / 2) {
               e.hp -= player.attackDamage;
               e.lastHitTime = now;
+              e.lastDamagedBy = 'player';
+              e.lastDamageSource = 'attack';
               e.pushVelocity.x = Math.cos(angleToEnemy) * 10;
               e.pushVelocity.y = Math.sin(angleToEnemy) * 10;
               spawnDamageText(e.pos.x, e.pos.y - 20, player.attackDamage.toString(), '#ffffff');
@@ -1392,7 +1397,7 @@ export default function App() {
         
         spawnParticles(player.pos.x, player.pos.y, '#3b82f6', 50);
         
-        const conversionRange = 300; // Increased range
+        const conversionRange = PLAYER_SKILL_RADIUS;
         let convertedCount = 0;
 
         for (let i = enemies.length - 1; i >= 0; i--) {
@@ -1401,15 +1406,16 @@ export default function App() {
             // Boss takes massive damage instead of conversion
             const dist = Math.hypot(enemy.pos.x - player.pos.x, enemy.pos.y - player.pos.y);
             if (dist < conversionRange) {
-              enemy.hp -= 300;
+              enemy.hp -= 100;
               enemy.lastHitTime = now;
-              spawnDamageText(enemy.pos.x, enemy.pos.y - 50, '300', '#ef4444');
+              spawnDamageText(enemy.pos.x, enemy.pos.y - 50, '100', '#ef4444');
             }
             continue;
           }
 
           const dist = Math.hypot(enemy.pos.x - player.pos.x, enemy.pos.y - player.pos.y);
           if (dist < conversionRange) {
+            if (enemy.type === PieceType.KING) continue;
             // Convert to Ally
             enemy.team = Team.BLUE;
             enemy.hp = enemy.maxHp;
@@ -1463,6 +1469,13 @@ export default function App() {
           state.gameWon = true;
           spawnParticles(enemy.pos.x, enemy.pos.y, '#fbbf24', 100);
         } else {
+          if (enemy.lastDamagedBy === 'player' && enemy.lastDamageSource === 'attack') {
+            // Normal attack corruption reward: +20 percentage points.
+            player.lastSkillTime = Math.max(
+              now - player.skillCooldown,
+              player.lastSkillTime - SKILL_CHARGE_BONUS_PER_CORRUPT_MS,
+            );
+          }
           // SHOGI CAPTURE MECHANIC: Enemy becomes Ally
           allies.push({
             ...enemy,
@@ -1835,7 +1848,7 @@ export default function App() {
       if (skillElapsed >= 0 && skillElapsed < 550) {
         const progress = skillElapsed / 550;
         const alpha = Math.max(0, 1 - progress);
-        const skillRadius = Math.max(0, (isBoss ? 320 : 300) * progress);
+        const skillRadius = Math.max(0, (isBoss ? 320 : PLAYER_SKILL_RADIUS) * progress);
         ctx.beginPath();
         ctx.arc(entity.pos.x, entity.pos.y, skillRadius, 0, Math.PI * 2);
         ctx.strokeStyle = isBoss
