@@ -107,6 +107,7 @@ export default function App() {
   const multiInputRef = useRef<MultiplayerInputState>({ seq: 0, roundId: 0, clientTime: Date.now(), moveX: 0, moveY: 0, attack: false, skill: false });
   const multiOutcomeRef = useRef({ gameOver: false, gameWon: false });
   const gameModeRef = useRef<'single' | 'multi' | null>(null);
+  const multiMatchTypeRef = useRef<'coop' | 'versus' | 'timed'>('versus');
   const roomCodeRef = useRef('');
   const pendingAutoJoinRef = useRef('');
   const inputSeqRef = useRef(0);
@@ -217,7 +218,7 @@ export default function App() {
     const state = gameStateRef.current;
     if (!state) return;
     const isDeadPlayer = state.player.isDead;
-    const isGhostMode = isDeadPlayer && multiState.matchType !== 'timed';
+    const isGhostMode = isDeadPlayer && multiMatchTypeRef.current !== 'timed';
 
     const sampledInput = {
       ...multiInputRef.current,
@@ -343,6 +344,7 @@ export default function App() {
     if (snapshot.roundId < roundIdRef.current) return;
     lastSnapshotAtRef.current = Date.now();
     timedEndsAtRef.current = snapshot.timedEndsAt ?? null;
+    multiMatchTypeRef.current = snapshot.matchType;
     setSyncRecovery(prev => (prev.active ? { active: false, retrying: false, message: '' } : prev));
     const localReceiveTime = Date.now();
     const observedDelay = Math.max(0, localReceiveTime - snapshot.serverTime);
@@ -1615,7 +1617,7 @@ export default function App() {
     const isRemote = entity.id.startsWith('remote-');
     const isLocalPlayer = entity.id === 'player';
     const isPlayerEntity = isLocalPlayer || isRemote;
-    const isTimedDeadPlayer = isPlayerEntity && entity.isDead && multiState.matchType === 'timed';
+    const isTimedDeadPlayer = isPlayerEntity && entity.isDead && multiMatchTypeRef.current === 'timed';
 
     if (isTimedDeadPlayer) {
       const respawnMs = Math.max(0, (entity.respawnAt ?? 0) - Date.now());
@@ -1990,6 +1992,10 @@ export default function App() {
   useEffect(() => {
     gameModeRef.current = gameMode;
   }, [gameMode]);
+
+  useEffect(() => {
+    multiMatchTypeRef.current = multiState.matchType;
+  }, [multiState.matchType]);
 
   useEffect(() => {
     roomCodeRef.current = multiState.roomCode;
