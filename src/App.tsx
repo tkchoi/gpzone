@@ -1547,7 +1547,8 @@ export default function App() {
     ctx.save();
     ctx.translate(entity.pos.x, entity.pos.y);
 
-    const isHit = now - entity.lastHitTime < 100;
+    const hitElapsed = now - entity.lastHitTime;
+    const isHit = hitElapsed >= 0 && hitElapsed < 100;
     const isBlue = entity.team === Team.BLUE;
     const isBoss = entity.type === PieceType.KING && entity.team === Team.RED && !entity.id.startsWith('remote-') && entity.id !== 'player';
     const isNeutral = entity.team === Team.NEUTRAL;
