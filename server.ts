@@ -298,6 +298,22 @@ function getTeamForOwner(room: RoomState, ownerId?: string): Team {
   return room.players[ownerId]?.team ?? Team.BLUE;
 }
 
+function applySkillChargeBonusForMinionCapture(
+  room: RoomState,
+  ownerId: string | undefined,
+  unit: Entity,
+  damageSource: Entity["lastDamageSource"],
+) {
+  if (!ownerId || unit.type === PieceType.KING || damageSource !== "attack") return;
+  const scorer = room.players[ownerId];
+  if (!scorer) return;
+
+  scorer.lastSkillTime = Math.max(
+    Date.now() - scorer.skillCooldown,
+    scorer.lastSkillTime - SKILL_CHARGE_BONUS_PER_CORRUPT_MS,
+  );
+}
+
 function recordPlayerHistory(room: RoomState, time: number) {
   for (const [socketId, player] of Object.entries(room.players)) {
     if (!room.playerHistory[socketId]) {
@@ -801,13 +817,7 @@ function cleanupUnits(room: RoomState) {
         const ownerId = enemy.lastDamagedBy;
         if (ownerId && room.players[ownerId]) {
           room.playerScores[ownerId] = (room.playerScores[ownerId] || 0) + 100;
-          if (enemy.type !== PieceType.KING && enemy.lastDamageSource === "attack") {
-            const scorer = room.players[ownerId];
-            scorer.lastSkillTime = Math.max(
-              Date.now() - scorer.skillCooldown,
-              scorer.lastSkillTime - SKILL_CHARGE_BONUS_PER_CORRUPT_MS,
-            );
-          }
+          applySkillChargeBonusForMinionCapture(room, ownerId, enemy, enemy.lastDamageSource);
           room.allies.push({
             ...enemy,
             id: randomId("ally"),
@@ -842,6 +852,7 @@ function cleanupUnits(room: RoomState) {
     if (isVersusRoom(room)) {
       const ownerId = ally.lastDamagedBy;
       if (ownerId && room.players[ownerId] && ownerId !== ally.ownerId) {
+        applySkillChargeBonusForMinionCapture(room, ownerId, ally, ally.lastDamageSource);
         room.allies[i] = {
           ...ally,
           id: randomId("ally"),
