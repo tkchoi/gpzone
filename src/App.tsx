@@ -157,7 +157,7 @@ export default function App() {
     speed: 5,
     radius: 24,
     attackRange: 90,
-    attackDamage: 40,
+    attackDamage: 20,
     attackCooldown: 400,
     lastAttackTime: 0,
     skillCooldown: PLAYER_SKILL_COOLDOWN_MS,

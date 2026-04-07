@@ -209,7 +209,7 @@ function createPlayer(socketId: string, index: number, total: number, matchType:
     speed: 10,
     radius: 24,
     attackRange: 90,
-    attackDamage: 40,
+    attackDamage: 20,
     attackCooldown: 400,
     lastAttackTime: 0,
     skillCooldown: PLAYER_SKILL_COOLDOWN_MS,
