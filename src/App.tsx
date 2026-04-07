@@ -1746,8 +1746,25 @@ export default function App() {
       return;
     }
 
-    let baseColor = isHit ? '#ffffff' : (isNeutral ? '#d1d5db' : (isBlue ? (isRemote ? '#064e3b' : '#1e3a8a') : '#7f1d1d'));
-    let topColor = isHit ? '#ffffff' : (isNeutral ? '#ffffff' : (isBlue ? (isRemote ? '#10b981' : '#3b82f6') : '#ef4444'));
+    let baseColor = '#7f1d1d';
+    let topColor = '#ef4444';
+    if (isNeutral) {
+      baseColor = '#d1d5db';
+      topColor = '#ffffff';
+    } else if (entity.team === Team.BLUE) {
+      baseColor = isRemote ? '#064e3b' : '#1e3a8a';
+      topColor = isRemote ? '#10b981' : '#3b82f6';
+    } else if (entity.team === Team.YELLOW) {
+      baseColor = '#854d0e';
+      topColor = '#eab308';
+    } else if (entity.team === Team.BLACK) {
+      baseColor = '#09090b';
+      topColor = '#3f3f46';
+    }
+    if (isHit) {
+      baseColor = '#ffffff';
+      topColor = '#ffffff';
+    }
     
     if (entity.color && entity.baseColor) {
       topColor = isHit ? '#ffffff' : entity.color;
